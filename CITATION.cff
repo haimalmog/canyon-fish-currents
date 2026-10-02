@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this code or data, please cite the article and this repository."
+title: "Near-bottom currents and fish communities in submarine canyons of the northern Gulf of Eilat/Aqaba: code and data"
+type: software
+authors:
+  - family-names: Haim
+    given-names: Almog
+    affiliation: "MEDsLab, Bar-Ilan University, Israel"
+license: MIT
+version: "1.0.0"
+date-released: "2026-10-02"
