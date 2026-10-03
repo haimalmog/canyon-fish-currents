@@ -1,4 +1,4 @@
-# Near-bottom currents and fish communities in submarine canyons of the northern Gulf of Eilat/Aqaba
+# Neighboring Marine Canyons Exhibit Distinct Physical and Ecological Signatures
 
 R code and data for the analyses and figures of:
 
