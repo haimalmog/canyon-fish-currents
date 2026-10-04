@@ -1,0 +1,631 @@
+---
+title: "Script 2 – Model vs. mooring near-bottom currents (Figures 5, S2, S3)"
+author: "Almog Haim – MEDsLab, Bar-Ilan University"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# Overview
+
+This script compares the near-bottom currents of the hydrodynamic model
+(Dec 2011 – Nov 2012, hourly) with the mooring observations, starting from
+the **raw files**, and reproduces:
+
+| Figure | Content |
+|---|---|
+| 5 | Mean current speed and persistence: model vs. mooring |
+| S2 | Principal axes of the current: model vs. mooring |
+| S3 | Full-year modelled near-bottom currents (stick plots) |
+
+The model is compared with each mooring over the same calendar period
+(the mooring dates transferred to the model year 2012), after both were
+averaged to hourly values.
+
+Code consolidated from the original model–mooring analysis script.
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+library(tidyverse)   # dplyr, tidyr, ggplot2, readr, stringr, purrr
+library(lubridate)   # date-time parsing
+library(patchwork)   # multi-panel figure assembly
+```
+
+# 1. Input files and settings
+
+All paths are relative to this script (the `scripts` folder). The mooring
+files are the same raw current-meter files used in Script 1 (`data/moorings`).
+The hydrodynamic-model output (hourly near-bottom currents at the 18 model
+stations, December 2011 – November 2012) is in `data/model`, stored as a
+gzip-compressed CSV that `read_csv()` reads directly.
+
+```{r paths}
+mooring_dir <- file.path("..", "data", "moorings")
+model_file  <- file.path("..", "data", "model",
+                         "near_bottom_currents_model_2011_2012.csv.gz")
+
+mooring_files <- tribble(
+  ~Canyon,    ~Location, ~Depth_m, ~file,
+  "Eilat",    "In",  100, file.path(mooring_dir, "eilat_100m_in_current.csv"),
+  "Eilat",    "Out", 100, file.path(mooring_dir, "eilat_100m_out_current.csv"),
+  "Princess", "In",  100, file.path(mooring_dir, "princess_100m_in_current.csv"),
+  "Princess", "Out", 100, file.path(mooring_dir, "princess_100m_out_current.csv"),
+  "Shlomo",   "In",  100, file.path(mooring_dir, "shlomo_100m_in_current.csv"),
+  "Shlomo",   "Out", 100, file.path(mooring_dir, "shlomo_100m_out_current.csv"),
+  "Shlomo",   "In",  200, file.path(mooring_dir, "shlomo_200m_in_current.csv"),
+  "Shlomo",   "Out", 200, file.path(mooring_dir, "shlomo_200m_out_current.csv")
+)
+
+# Output folder for figures, tables and the saved workspace
+out_dir <- file.path("..", "outputs")
+fig_dir <- out_dir
+dir.create(fig_dir, showWarnings = FALSE)
+
+missing <- c(mooring_files$file, model_file)[!file.exists(c(mooring_files$file, model_file))]
+if (length(missing) > 0) stop("Missing input file(s):\n", paste(missing, collapse = "\n"))
+```
+
+```{r settings}
+# Hours removed at the start and at the end of every mooring record
+# (deployment and recovery of the moorings) – same rule as in Script 1
+trim_hours <- 3
+
+# Stick plots of the model year (Figure S3)
+stick_bin_hours <- 24     # velocities averaged over daily bins
+x_scale_factor  <- 4000   # horizontal stretch of the arrows (x in seconds, u in cm/s)
+
+canyon_levels <- c("Eilat", "Shlomo", "Princess")
+canyon_cols   <- c("Eilat" = "steelblue", "Shlomo" = "darkorange", "Princess" = "darkgreen")
+source_cols   <- c("Mooring" = "#F8766D", "Model" = "#00BFC4")
+season_cols   <- c("Winter" = "#D8C2C2", "Spring" = "#C9D7B8",
+                   "Summer" = "#B8D4D8", "Autumn" = "#D2C3D8")
+
+# ---------------------------------------------------------------------------
+# Figure style – used by every figure so that all figures look the same
+# ---------------------------------------------------------------------------
+# Font: Times New Roman, requested through R's generic "serif" family.
+# "serif" is understood by every R graphics device (screen, png, pdf,
+# cairo_pdf, ragg) and is drawn as Times New Roman on Windows (Times on
+# macOS). Asking for "Times New Roman" by name makes the standard pdf() and
+# png() devices fail silently, which produces empty files.
+font_family <- "serif"
+
+# Text sizes (pt) shared by all figures
+fig_sizes <- list(
+  axis_title   = 18,   # axis titles
+  axis_text    = 14,   # axis numbers
+  strip        = 16,   # panel title strips
+  legend_title = 16,
+  legend_text  = 14,
+  legend_key   = 1.3,  # size of the legend colour boxes (lines)
+  tag          = 18,   # panel letters
+  annotation   = 4.5   # text inside panels (mm, ggplot units)
+)
+
+theme_fig <- theme(
+  text         = element_text(family = font_family),
+  axis.title   = element_text(size = fig_sizes$axis_title),
+  axis.text    = element_text(size = fig_sizes$axis_text, colour = "black"),
+  strip.text   = element_text(size = fig_sizes$strip),
+  legend.title = element_text(size = fig_sizes$legend_title, face = "bold"),
+  legend.text  = element_text(size = fig_sizes$legend_text),
+  plot.tag     = element_text(size = fig_sizes$tag, face = "bold")
+)
+
+# Text drawn inside the panels (geom_text / geom_label) uses the same font
+update_geom_defaults("text",  list(family = font_family))
+update_geom_defaults("label", list(family = font_family))
+
+# Single y-axis title (left) and x-axis title (bottom) for a whole figure
+add_figure_titles <- function(panels, y = NULL, x = NULL, x_hjust = 0.5,
+                              size = fig_sizes$axis_title) {
+  wrap_elements(panel = panels) +
+    labs(tag = y, caption = x) +
+    theme(text              = element_text(family = font_family),
+          plot.tag          = element_text(angle = 90, size = size),
+          plot.tag.position = "left",
+          plot.caption      = element_text(size = size, hjust = x_hjust))
+}
+
+# Hide axis numbers but keep their space, so that panels stay evenly spaced
+hide_axis_text <- function(axis = c("x", "y")) {
+  axis <- match.arg(axis)
+  if (axis == "x") {
+    theme(axis.text.x = element_text(colour = "transparent"),
+          axis.ticks.x = element_line(colour = "transparent"))
+  } else {
+    theme(axis.text.y = element_text(colour = "transparent"),
+          axis.ticks.y = element_line(colour = "transparent"))
+  }
+}
+
+# Save a figure as PDF (vector, embedded font), 300-dpi PNG and 300-dpi TIFF.
+# Always pass the figure object explicitly: ggsave() without `plot =` saves
+# ggplot2's "last plot", which for a patchwork figure can be one of its
+# internal pieces (e.g. the empty legend panel).
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  has_ragg   <- requireNamespace("ragg", quietly = TRUE)
+  pdf_device <- if (capabilities("cairo")) cairo_pdf else "pdf"
+  files <- file.path(fig_dir, paste0(name, c(".pdf", ".png", ".tiff")))
+  start <- Sys.time() - 1
+
+  ggsave(files[1], plot, width = width, height = height, device = pdf_device)
+  ggsave(files[2], plot, width = width, height = height, dpi = dpi, bg = "white",
+         device = if (has_ragg) ragg::agg_png else "png")
+  ggsave(files[3], plot, width = width, height = height, dpi = dpi, bg = "white",
+         device = if (has_ragg) ragg::agg_tiff else "tiff", compression = "lzw")
+
+  # Windows cannot overwrite a file that is open in another program (image
+  # viewer, PDF reader, Explorer preview pane). Check that every file was
+  # really rewritten and say so if not.
+  not_updated <- files[is.na(file.mtime(files)) | file.mtime(files) < start]
+  if (length(not_updated) > 0) {
+    warning("Not updated (probably open in another program - close it and run again):\n  ",
+            paste(not_updated, collapse = "\n  "), call. = FALSE)
+  } else {
+    message("Saved: ", paste(basename(files), collapse = ", "))
+  }
+
+  set_last_plot(plot)   # so that a later ggsave() without `plot =` also saves this figure
+  invisible(plot)
+}
+
+
+# Panel letters in the top-left corner of each panel
+tag_inside <- function(x = 0.01, y = 0.99, size = fig_sizes$tag) {
+  theme(plot.tag = element_text(size = size, face = "bold"), plot.tag.position = c(x, y))
+}
+
+# Axis labels with at most two decimals, trailing zeros dropped
+label_2dec  <- function(x) sub("\\.?0+$", "", sprintf("%.2f", x))
+
+# Legend drawn from a separate, otherwise empty plot, so that it appears once
+# and looks the same in every ggplot2 version
+# `scale` enlarges text and keys (e.g. 1.25 = 25 % larger than the default)
+legend_panel <- function(p, scale = 1) {
+  wrap_elements(full = p + theme_void() +
+    theme(legend.position = "left",
+          legend.key.size = unit(fig_sizes$legend_key * scale, "lines"),
+          text         = element_text(family = font_family),
+          legend.title = element_text(face = "bold", size = fig_sizes$legend_title * scale),
+          legend.text  = element_text(size = fig_sizes$legend_text * scale)))
+}
+```
+
+# 2. Helper functions
+
+```{r helpers}
+# Remove the first and the last `n_hours` of a record (deployment/recovery)
+trim_deployment_edges <- function(df, n_hours = trim_hours) {
+  df %>% filter(
+    time >= min(time, na.rm = TRUE) + hours(n_hours),
+    time <= max(time, na.rm = TRUE) - hours(n_hours)
+  )
+}
+
+# One raw mooring file -> time (UTC, as the model), u (east) and v (north), cm/s
+read_mooring <- function(file, canyon, location, depth) {
+  # time read as text: automatic parsing drops the time of day at midnight
+  read_csv(file, show_col_types = FALSE,
+           col_types = cols(`ISO 8601 Time` = col_character(), .default = col_guess())) %>%
+    transmute(
+      time = ymd_hms(`ISO 8601 Time`, tz = "UTC"),
+      Canyon = canyon, Location = location, Depth_m = depth,
+      u = `Velocity-E (cm/s)`,
+      v = `Velocity-N (cm/s)`
+    ) %>%
+    filter(!is.na(time)) %>%
+    arrange(time) %>%
+    trim_deployment_edges()
+}
+
+# Summary statistics of the current at each station
+calculate_current_stats <- function(data, dataset_name) {
+  data %>%
+    group_by(Canyon, Location, Depth_m) %>%
+    summarise(
+      N             = n(),
+      Duration_days = as.numeric(difftime(max(time), min(time), units = "days")),
+      Mean_speed    = mean(speed, na.rm = TRUE),
+      Median_speed  = median(speed, na.rm = TRUE),
+      SD_speed      = sd(speed, na.rm = TRUE),
+      P90_speed     = as.numeric(quantile(speed, 0.90, na.rm = TRUE)),
+      Mean_U        = mean(u, na.rm = TRUE),
+      Mean_V        = mean(v, na.rm = TRUE),
+      Vector_mean_speed = sqrt(Mean_U^2 + Mean_V^2),
+      Persistence   = Vector_mean_speed / Mean_speed,   # 1 = always the same direction
+      North_pct     = mean(v > 0, na.rm = TRUE) * 100,
+      South_pct     = mean(v < 0, na.rm = TRUE) * 100,
+      East_pct      = mean(u > 0, na.rm = TRUE) * 100,
+      West_pct      = mean(u < 0, na.rm = TRUE) * 100,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      # Direction of the mean current vector (0 = North, 90 = East)
+      Mean_direction_deg = (atan2(Mean_U, Mean_V) * 180 / pi + 360) %% 360,
+      Dataset = dataset_name
+    )
+}
+
+# Principal axis of the current fluctuations: first eigenvector of the u'-v'
+# covariance matrix, as a compass bearing between 0 and 180 degrees
+calculate_principal_axis <- function(data, dataset_name) {
+  data %>%
+    filter(!is.na(u), !is.na(v)) %>%
+    group_by(Canyon, Location, Depth_m) %>%
+    group_modify(~ {
+      eig <- eigen(cov(cbind(.x$u - mean(.x$u), .x$v - mean(.x$v))))
+      major <- eig$vectors[, 1]
+      tibble(
+        Principal_axis_deg     = (atan2(major[1], major[2]) * 180 / pi) %% 180,
+        Variance_explained_pct = 100 * eig$values[1] / sum(eig$values),
+        Major_axis_SD          = sqrt(eig$values[1]),
+        Minor_axis_SD          = sqrt(eig$values[2]),
+        Minor_major_ratio      = sqrt(eig$values[2] / eig$values[1])
+      )
+    }) %>%
+    ungroup() %>%
+    mutate(Dataset = dataset_name)
+}
+
+# Smallest difference between two directions (0–180) and two axes (0–90)
+angular_difference <- function(a, b) abs((a - b + 180) %% 360 - 180)
+axial_difference   <- function(a, b) abs((a - b + 90) %% 180 - 90)
+
+# Meteorological seasons (Dec–Feb winter, Mar–May spring, ...)
+make_season_bands <- function(time_vec) {
+  years <- seq(year(min(time_vec)) - 1, year(max(time_vec)))
+  map_dfr(years, function(y) tibble(
+    season = c("Winter", "Spring", "Summer", "Autumn"),
+    xmin = as.POSIXct(paste0(c(y, y + 1, y + 1, y + 1), c("-12-01", "-03-01", "-06-01", "-09-01")), tz = "UTC"),
+    xmax = as.POSIXct(paste0(y + 1, c("-03-01", "-06-01", "-09-01", "-12-01")), tz = "UTC")
+  )) %>%
+    filter(xmax >= min(time_vec), xmin <= max(time_vec)) %>%
+    mutate(xmin = pmax(xmin, min(time_vec)), xmax = pmin(xmax, max(time_vec)),
+           season = factor(season, levels = names(season_cols)))
+}
+```
+
+# 3. Load the data
+
+```{r load-moorings}
+mooring <- pmap_dfr(mooring_files, function(Canyon, Location, Depth_m, file) {
+  read_mooring(file, Canyon, Location, Depth_m)
+})
+
+# Hourly means, to match the model resolution
+mooring_hourly <- mooring %>%
+  mutate(time = floor_date(time, "hour")) %>%
+  group_by(Canyon, Location, Depth_m, time) %>%
+  summarise(u = mean(u, na.rm = TRUE), v = mean(v, na.rm = TRUE), .groups = "drop") %>%
+  mutate(speed = sqrt(u^2 + v^2), Source = "Mooring")
+
+# Period of each mooring record (after trimming)
+mooring_windows <- mooring %>%
+  group_by(Canyon, Location, Depth_m) %>%
+  summarise(Mooring_start = min(time), Mooring_end = max(time), N = n(), .groups = "drop") %>%
+  mutate(Model_start = update(Mooring_start, year = 2012),   # same calendar dates,
+         Model_end   = update(Mooring_end,   year = 2012))   # in the model year
+
+mooring_windows
+```
+
+```{r load-model}
+model <- read_csv(model_file, show_col_types = FALSE) %>%
+  transmute(
+    time = dmy_hm(DateTime, tz = "UTC"),
+    Canyon, Location,
+    Depth_m = TargetDepth_m,
+    BottomDepth_m,
+    u = U_cm_s, v = V_cm_s,
+    speed = sqrt(u^2 + v^2),
+    Source = "Model"
+  )
+
+# Model grid points at the mooring stations, full year and same season
+model_matching <- model %>%
+  semi_join(distinct(mooring_hourly, Canyon, Location, Depth_m),
+            by = c("Canyon", "Location", "Depth_m"))
+
+model_seasonal <- model_matching %>%
+  inner_join(select(mooring_windows, Canyon, Location, Depth_m, Model_start, Model_end),
+             by = c("Canyon", "Location", "Depth_m")) %>%
+  filter(time >= Model_start, time <= Model_end) %>%
+  select(-Model_start, -Model_end)
+```
+
+# 4. Model–mooring comparison tables
+
+```{r stats}
+comparison_long <- bind_rows(
+  calculate_current_stats(mooring_hourly, "Mooring"),
+  calculate_current_stats(model_seasonal, "Model_seasonal"),
+  calculate_current_stats(model_matching, "Model_full")
+)
+
+comparison_compact <- comparison_long %>%
+  select(Canyon, Location, Depth_m, Dataset, Mean_speed, Mean_direction_deg, Persistence) %>%
+  pivot_wider(names_from = Dataset,
+              values_from = c(Mean_speed, Mean_direction_deg, Persistence)) %>%
+  left_join(distinct(model_matching, Canyon, Location, Depth_m, BottomDepth_m),
+            by = c("Canyon", "Location", "Depth_m")) %>%
+  mutate(
+    Canyon = factor(Canyon, levels = canyon_levels),
+    Bathymetry_difference = abs(Depth_m - BottomDepth_m),
+    Speed_difference_pct  = 100 * (Mean_speed_Model_seasonal - Mean_speed_Mooring) / Mean_speed_Mooring,
+    Direction_difference  = angular_difference(Mean_direction_deg_Model_seasonal,
+                                               Mean_direction_deg_Mooring),
+    Station = factor(paste0(Location, " ", Depth_m, " m"),
+                     levels = c("In 100 m", "Out 100 m", "In 200 m", "Out 200 m"))
+  ) %>%
+  arrange(Canyon, Depth_m, Location)
+
+comparison_compact %>%
+  select(Canyon, Station, BottomDepth_m, Mean_speed_Mooring, Mean_speed_Model_seasonal,
+         Mean_speed_Model_full, Speed_difference_pct, Persistence_Mooring,
+         Persistence_Model_seasonal, Direction_difference) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  knitr::kable()
+
+principal_comparison <- bind_rows(
+  calculate_principal_axis(mooring_hourly, "Mooring"),
+  calculate_principal_axis(model_seasonal, "Model")
+) %>%
+  pivot_wider(names_from = Dataset,
+              values_from = c(Principal_axis_deg, Variance_explained_pct,
+                              Major_axis_SD, Minor_axis_SD, Minor_major_ratio)) %>%
+  mutate(Axis_difference_deg = axial_difference(Principal_axis_deg_Mooring,
+                                                Principal_axis_deg_Model),
+         Canyon = factor(Canyon, levels = canyon_levels)) %>%
+  arrange(Canyon, Depth_m, Location)
+
+principal_comparison %>%
+  select(Canyon, Location, Depth_m, Principal_axis_deg_Mooring, Principal_axis_deg_Model,
+         Axis_difference_deg, Variance_explained_pct_Mooring, Variance_explained_pct_Model) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1))) %>%
+  knitr::kable()
+```
+
+```{r export-tables}
+write_csv(comparison_long,      file.path(fig_dir, "Table_Model_Mooring_comparison_long.csv"))
+write_csv(comparison_compact,   file.path(fig_dir, "Table_Model_Mooring_comparison_compact.csv"))
+write_csv(principal_comparison, file.path(fig_dir, "Table_Principal_axes.csv"))
+```
+
+# 5. Figure 5 – mean speed and persistence
+
+```{r fig5, fig.width=15, fig.height=7}
+station_shapes <- c("In 100 m" = 15, "Out 100 m" = 16, "In 200 m" = 17, "Out 200 m" = 18)
+
+theme_scatter <- theme_classic() + theme_fig
+
+scatter_panel <- function(x, y, lim, breaks, xlab, ylab) {
+  ggplot(comparison_compact, aes(x = .data[[x]], y = .data[[y]],
+                                 colour = Canyon, shape = Station)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", linewidth = 0.8, colour = "grey40") +
+    geom_point(size = 5) +
+    scale_colour_manual(values = canyon_cols, guide = "none") +
+    scale_shape_manual(values = station_shapes, guide = "none") +
+    scale_x_continuous(limits = lim, breaks = breaks, labels = label_2dec,
+                       expand = expansion(mult = c(0, 0.02))) +
+    scale_y_continuous(limits = lim, breaks = breaks, labels = label_2dec,
+                       expand = expansion(mult = c(0, 0.02))) +
+    coord_equal() +
+    labs(x = xlab, y = ylab) +
+    theme_scatter
+}
+
+max_speed <- max(c(comparison_compact$Mean_speed_Mooring,
+                   comparison_compact$Mean_speed_Model_seasonal)) * 1.08
+
+p_speed <- scatter_panel("Mean_speed_Mooring", "Mean_speed_Model_seasonal",
+                         lim = c(0, max_speed), breaks = seq(0, 12, by = 3),
+                         xlab = expression(Mooring~mean~speed~(cm~s^{-1})),
+                         ylab = expression(Model~mean~speed~(cm~s^{-1})))
+
+p_persistence <- scatter_panel("Persistence_Mooring", "Persistence_Model_seasonal",
+                               lim = c(0, 1), breaks = seq(0, 1, by = 0.2),
+                               xlab = "Mooring persistence", ylab = "Model persistence")
+
+legend_fig5 <- legend_panel(
+  ggplot(comparison_compact, aes(x = 0, y = 0)) +
+    geom_point(aes(colour = Canyon), alpha = 0, size = 5) +
+    geom_point(aes(shape = Station), alpha = 0, size = 5) +
+    scale_colour_manual(values = canyon_cols, name = "Canyon:",
+                        guide = guide_legend(order = 1, override.aes = list(alpha = 1, shape = 16, size = 7))) +
+    scale_shape_manual(values = station_shapes, name = "Station:",
+                       guide = guide_legend(order = 2, override.aes = list(alpha = 1, size = 7))),
+  scale = 1.3
+)
+
+figure5 <- p_speed + p_persistence + legend_fig5 +
+  plot_layout(widths = c(1, 1, 0.55)) +
+  plot_annotation(tag_levels = list(c("A", "B", ""))) &
+  tag_inside(0.02, 0.99)
+
+figure5
+
+save_figure(figure5, "Figure 5", width = 15, height = 7)
+```
+
+# 6. Figure S2 – principal axes
+
+Each panel shows the principal axis of the mooring and of the model at one
+station. The length of the lines is fixed; the percentage of variance
+explained by each axis is given above the circle and the difference between
+the two axes (Δθ) below it.
+
+```{r figS2-axes, fig.width=16, fig.height=9}
+s1_order <- tribble(
+  ~Canyon,    ~Location, ~Depth_m,
+  "Eilat",    "In",  100, "Eilat",    "Out", 100,
+  "Princess", "In",  100, "Princess", "Out", 100,
+  "Shlomo",   "In",  100, "Shlomo",   "Out", 100,
+  "Shlomo",   "In",  200, "Shlomo",   "Out", 200
+)
+
+circle <- tibble(a = seq(0, 2 * pi, length.out = 361), x = sin(a), y = cos(a))
+cross  <- tibble(x = c(-1, 0), xend = c(1, 0), y = c(0, -1), yend = c(0, 1))
+compass <- tibble(label = c("N", "E", "S", "W"),
+                  x = c(0, 1.15, 0, -1.15), y = c(1.15, 0, -1.15, 0))
+
+axis_panel <- function(cy, loc, dep) {
+  pc <- principal_comparison %>% filter(Canyon == cy, Location == loc, Depth_m == dep)
+  axes <- tibble(Source = factor(c("Mooring", "Model"), levels = names(source_cols)),
+                 deg = c(pc$Principal_axis_deg_Mooring, pc$Principal_axis_deg_Model)) %>%
+    mutate(xend = 0.85 * sin(deg * pi / 180), yend = 0.85 * cos(deg * pi / 180))
+
+  ggplot() +
+    geom_path(data = circle, aes(x, y), colour = "grey70", linewidth = 0.4) +
+    geom_segment(data = cross, aes(x = x, y = y, xend = xend, yend = yend),
+                 colour = "grey80", linewidth = 0.3) +
+    geom_segment(data = axes, aes(x = -xend, y = -yend, xend = xend, yend = yend, colour = Source),
+                 linewidth = 1.6, lineend = "round") +
+    annotate("point", x = 0, y = 0, size = 1.5) +
+    geom_text(data = compass, aes(x, y, label = label), size = fig_sizes$annotation) +
+    annotate("text", x = 0, y = 1.42, size = fig_sizes$annotation,
+             label = sprintf("Mooring: %.0f%% | Model: %.0f%%",
+                             pc$Variance_explained_pct_Mooring, pc$Variance_explained_pct_Model)) +
+    annotate("text", x = 0, y = -1.42, size = fig_sizes$annotation,
+             label = sprintf("Δθ = %.1f°", pc$Axis_difference_deg)) +
+    scale_colour_manual(values = source_cols, guide = "none") +
+    coord_fixed(xlim = c(-1.3, 1.3), ylim = c(-1.55, 1.55), clip = "off") +
+    labs(title = paste0(cy, " ", loc, " ", dep, " m")) +
+    theme_void() +
+    theme(text = element_text(family = font_family),
+          plot.title = element_text(face = "bold", size = fig_sizes$strip, hjust = 0.5),
+          plot.tag   = element_text(size = fig_sizes$tag, face = "bold"))
+}
+
+s1_panels <- pmap(s1_order, function(Canyon, Location, Depth_m) axis_panel(Canyon, Location, Depth_m))
+
+legend_s1 <- legend_panel(
+  ggplot(tibble(Source = factor(names(source_cols), levels = names(source_cols))),
+         aes(x = 0, y = 0, colour = Source)) +
+    geom_path(alpha = 0, linewidth = 1.6) +
+    scale_colour_manual(values = source_cols, name = NULL,
+                        guide = guide_legend(override.aes = list(alpha = 1, linewidth = 2.5))),
+  scale = 1.4
+)
+
+design_s1 <- "
+ABCDI
+EFGHI
+"
+
+figureS2 <- wrap_plots(s1_panels) + legend_s1 +
+  plot_layout(design = design_s1, widths = c(1, 1, 1, 1, 0.6)) +
+  plot_annotation(tag_levels = list(c(LETTERS[1:8], ""))) &
+  tag_inside(0.02, 0.99)
+
+figureS2
+
+save_figure(figureS2, "Figure S2", width = 16, height = 9)
+```
+
+# 7. Figure S3 – full-year modelled near-bottom currents
+
+Stick plots of the model currents at all deep stations (daily means):
+one row per depth and two columns per canyon (inside / outside). The
+stations of each canyon share the y axis. Each
+arrow starts at (time, 0) and points to (time + u × `x_scale_factor`, v).
+The red line marks the mean current speed (drawn at −mean speed); the
+background colours mark the seasons.
+
+```{r figS3, fig.width=26, fig.height=11}
+stick_model <- model %>%
+  mutate(time = floor_date(time, paste(stick_bin_hours, "hours"))) %>%
+  group_by(Canyon, Location, Depth_m, time) %>%
+  summarise(u = mean(u, na.rm = TRUE), v = mean(v, na.rm = TRUE), .groups = "drop")
+
+mean_speed_model <- model %>%
+  group_by(Canyon, Location, Depth_m) %>%
+  summarise(avg_speed = mean(speed, na.rm = TRUE), .groups = "drop")
+
+season_bands <- make_season_bands(model$time)
+
+# y range of each canyon (shared by its In and Out stations and all depths)
+ylim_canyon <- stick_model %>%
+  left_join(mean_speed_model, by = c("Canyon", "Location", "Depth_m")) %>%
+  group_by(Canyon) %>%
+  summarise(lo = min(c(v, -avg_speed)), hi = max(v), .groups = "drop")
+
+# Figure S3 is very wide, so its text is enlarged (factor s2_text_scale)
+s2_text_scale <- 1.35
+
+theme_stick <- theme_bw() + theme_fig +
+  theme(axis.text   = element_text(size = fig_sizes$axis_text * s2_text_scale, colour = "black"),
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        strip.text  = element_text(size = fig_sizes$strip * 1.15),   # longer station names
+        panel.grid.minor = element_blank())
+
+stick_panel_model <- function(cy, loc, dep, show_x, show_y) {
+  d  <- filter(stick_model, Canyon == cy, Location == loc, Depth_m == dep) %>%
+    mutate(panel = paste0(cy, " ", dep, " m - ", loc))
+  ms <- filter(mean_speed_model, Canyon == cy, Location == loc, Depth_m == dep)
+  yl <- filter(ylim_canyon, Canyon == cy)
+
+  p <- ggplot(d) +
+    geom_rect(data = season_bands, aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf,
+                                       fill = season),
+              inherit.aes = FALSE, alpha = 0.35) +
+    geom_hline(yintercept = 0, colour = "grey40", linetype = "dashed", linewidth = 0.7) +
+    geom_segment(aes(x = time, y = 0, xend = time + u * x_scale_factor, yend = v),
+                 colour = "mediumblue", linewidth = 0.45) +
+    geom_hline(yintercept = -ms$avg_speed, colour = "red", linewidth = 0.7, alpha = 0.85) +
+    facet_wrap(~ panel) +
+    scale_fill_manual(values = season_cols, guide = "none") +
+    scale_x_datetime(date_breaks = "2 months", date_labels = "%m/%y",
+                     expand = expansion(mult = 0.005)) +
+    scale_y_continuous(labels = label_2dec) +
+    coord_cartesian(ylim = c(yl$lo, yl$hi)) +
+    labs(x = NULL, y = NULL) +
+    theme_stick
+  # all rows share the same dates: x numbers only under the bottom row
+  # (removed, not just hidden, so that the rows sit close together)
+  if (!show_x) p <- p + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+  if (!show_y) p <- p + hide_axis_text("y")
+  p
+}
+
+# 3 rows (depth) x 6 columns (In / Out of each canyon); y numbers only on the
+# "In" column of each canyon, x numbers only under the bottom row
+s2_order <- expand_grid(Depth_m = c(100, 200, 300), Canyon = canyon_levels,
+                        Location = c("In", "Out"))
+
+s2_panels <- pmap(s2_order, function(Depth_m, Canyon, Location) {
+  stick_panel_model(Canyon, Location, Depth_m,
+                    show_x = Depth_m == 300,
+                    show_y = Location == "In")
+})
+
+legend_s2 <- legend_panel(
+  ggplot(season_bands, aes(x = 0, y = 0, fill = season)) +
+    geom_tile(alpha = 0) +
+    scale_fill_manual(values = season_cols, name = "Season:",
+                      guide = guide_legend(override.aes = list(alpha = 0.6, colour = "black"))),
+  scale = s2_text_scale
+)
+
+figureS3_panels <- wrap_plots(s2_panels, ncol = 6) | legend_s2
+figureS3_panels <- figureS3_panels + plot_layout(widths = c(1, 0.1)) +
+  plot_annotation(tag_levels = list(c(LETTERS[1:18], ""))) &
+  tag_inside(0.01, 0.99)
+
+figureS3 <- add_figure_titles(figureS3_panels, y = "North–South velocity (cm s⁻¹)",
+                              size = fig_sizes$axis_title * s2_text_scale)
+
+figureS3
+
+save_figure(figureS3, "Figure S3", width = 26, height = 11)
+```
+
+# Save the workspace and the R session information
+
+```{r save-session}
+save.image(file = file.path(out_dir, "02_Model_Mooring_Comparison.RData"))
+sessionInfo()
+```
