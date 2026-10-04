@@ -10,5 +10,4 @@ scripts/*.html
 scripts/*_files/
 scripts/*_cache/
 
-# Hydrodynamic-model output (not distributed, see data/model/README.md)
-data/model/*.csv
+
