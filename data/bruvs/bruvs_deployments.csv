@@ -1,0 +1,57 @@
+OpCode,sea,location,Canyon,Canyon_Location,lat_y,lon_x,date,dep_time,system_id,depth,temperature,seabed,seabed_form,Substrate,complexity
+isrwest240220F,red,west beach,Princess,In,29.49311,34.91629,24/02/2020,13:04,1,103.7,21,sand,unconsolidated,Soft,0
+isrnort130520F,red,north beach,Eilat,In,29.53408,34.95568,13/05/2020,14:28,2,115,20,rocks & sand,both,Hard,4
+isrwest140520F,red,west beach,Princess,Out,29.4991,34.92227,14/05/2020,14:25,2,105,20,sand & corals,both,Mixed,2
+isrnort010920B,red,north beach,Eilat,In,29.53347,34.95877,09/01/2020,09:17,2,106,23,sand & corals,both,Mixed,4
+isrnort010920A,red,north beach,Eilat,In,29.53428,34.95478,09/01/2020,08:52,1,123,22,sand,unconsolidated,Soft,0
+isrwest020920B,red,west beach,Eilat,Out,29.53213,34.94622,09/02/2020,08:33,2,117,22,sand,unconsolidated,Soft,1
+isrwest020920A,red,west beach,Eilat,Out,29.5291,34.94395,09/02/2020,08:14,1,135,22,sand,unconsolidated,Soft,1
+isrnort231220D,red,north beach,Eilat,Out,29.53133,34.96712,23/12/2020,10:00,2,107,23,rocks & sand,both,Mixed,2
+isrnort231220B,red,north beach,Eilat,Out,29.53105,34.96603,23/12/2020,07:58,2,123,23,rocks & sand,both,Mixed,1
+isrnort231220A,red,north beach,Eilat,Out,29.5304,34.96603,23/12/2020,07:30,1,138,23,na,na,na,na
+isrnort231220C,red,north beach,Eilat,Out,29.53013,34.9652,23/12/2020,09:20,1,142,22,rocks & sand,both,Mixed,1
+isrwest241220C,red,west beach,Shlomo,Out,29.51693,34.93553,24/12/2020,09:00,1,98,23,sand & corals,both,Mixed,2
+isrwest241220B,red,west beach,Shlomo,In,29.51422,34.93455,24/12/2020,07:30,2,110.5,23,sand & corals,both,Mixed,2
+isrwest241220A,red,west beach,Shlomo,In,29.51215,34.9332,24/12/2020,07:10,1,136,23,sand & corals,both,Mixed,2
+isrnort170321H,red,north beach,Eilat,In,29.53308,34.95935,17/03/2021,14:45,2,112,21,silt,unconsolidated,Soft,0
+isrnort170321B,red,north beach,Eilat,Out,29.53158,34.96148,17/03/2021,08:00,1,122.7,20,silt & corals,both,Mixed,2
+isrnort170321A,red,north beach,Eilat,Out,29.53087,34.96022,17/03/2021,07:40,2,137.8,20,silt & corals,both,Mixed,2
+isrwest180321B,red,west beach,Princess,Out,29.4959,34.9201,18/03/2021,07:45,1,118.2,20,silt & corals,both,Mixed,2
+isrwest180321A,red,west beach,Princess,Out,29.4975,34.9224,18/03/2021,07:25,2,137,20,silt & corals,both,Mixed,3
+isrwest180321G,red,west beach,Princess,Out,29.4986,34.92363,18/03/2021,12:50,2,140,19,silt & corals,both,Mixed,1
+isrnort120721C,red,north beach,Eilat,Out,29.53187,34.96373,07/12/2021,09:45,2,110,22,corals,consolidated,Hard,4
+isrnort120721B,red,north beach,Eilat,Out,29.53187,34.96285,07/12/2021,08:20,1,128,22,silt & corals,both,Mixed,4
+isrnort120721A,red,north beach,Eilat,Out,29.53107,34.96095,07/12/2021,07:58,2,137,21,silt & rocks,both,Mixed,2
+isrwest130721C,red,west beach,Shlomo,In,29.51035,34.93137,13/07/2021,09:35,2,98.5,23,na,both,na,na
+isrwest130721B,red,west beach,Shlomo,Out,29.50905,34.93102,13/07/2021,08:03,1,128,22,silt & corals,both,Mixed,2
+isrwest130721A,red,west beach,Shlomo,Out,29.5063,34.92932,13/07/2021,07:45,2,144,21,rocks & corals & artificial,consolidated,Mixed,3
+isrnort131021B,red,north beach,Eilat,In,29.53422,34.95443,13/10/2021,08:07,2,119.9,22,corals,consolidated,Hard,4
+isrnort131021G,red,north beach,Eilat,In,29.53352,34.95668,13/10/2021,12:59,1,125,22,sand & corals,both,Mixed,2
+isrnort131021A,red,north beach,Eilat,In,29.53327,34.95017,13/10/2021,07:42,1,141,21,silt,unconsolidated,Soft,0
+isrwest141021E,red,west beach,Shlomo,Out,29.50367,34.92648,14/10/2021,11:05,2,121.4,21,sand & corals,both,Mixed,3
+isrwest141021C,red,west beach,Shlomo,Out,29.5042,34.92752,14/10/2021,09:20,2,145.3,21,silt,unconsolidated,Soft,0
+isrwest260122B,red,west beach,Princess,Out,29.49541,34.9197,26/01/2022,08:20,1,114,21,silt & corals,both,Mixed,2
+isrwest260122A,red,west beach,Shlomo,Out,29.50283,34.9263,26/01/2022,08:05,2,140,21,silt,unconsolidated,Soft,0
+isrwest260122C,red,west beach,Princess,In,29.49234,34.91689,26/01/2022,09:45,2,149,21,silt & corals,both,Mixed,4
+isrnort270122B,red,north beach,Eilat,In,29.53224,34.95823,27/01/2022,07:50,2,123,21,silt & rocks & corals,both,Mixed,2
+isrnort270122A,red,north beach,Eilat,In,29.53296,34.95282,27/01/2022,07:35,1,135,21,silt & rocks & corals,both,Mixed,2
+isrnort270122C,red,north beach,Eilat,Out,29.53056,34.96271,27/01/2022,09:20,1,135,21,silt & rocks & corals,both,Mixed,1
+isrnort111225A,red,north beach,Eilat,In,29.5255166,34.955517,11/12/2025,09:00,1,260,21,sand,unconsolidated,Soft,0
+isrwest291225A,red,west beach,Princess,In,29.494999,34.917998,29/12/2025,09:30,1,90,21,silt & rocks & corals,both,Mixed,4
+iswest150126A,red,west beach,Shlomo,In,29.51225,34.932121,15/01/2026,09:38,1,110,23,sand,unconsolidated,Soft,0
+iswest220126A,red,west beach,Shlomo,In,29.514433,34.934767,22/01/2026,09:30,1,100,23,silt  & corals,consolidated,Mixed,3
+iswest270126A,red,west beach,Princess,In,29.4931,34.916483,27/01/2026,11:30,1,100,23,sand,unconsolidated,Soft,0
+iswest050226A,red,west beach,Shlomo,In,29.513067,34.933583,05/02/2026,08:45,1,100,23,corals,consolidated,Hard,4
+iswest050226B,red,west beach,Shlomo,Out,29.51655,34.935983,05/02/2026,10:22,1,110,23,silt  & corals,unconsolidated,Mixed,3
+iswest110226A,red,west beach,Shlomo,In,29.512667,34.932717,11/02/2026,13:00,1,90,23,corals,consolidated,Hard,4
+iswest110226B,red,west beach,Shlomo,Out,29.517733,34.93595,11/02/2026,14:36,1,100,23,sand & corals,unconsolidated,Mixed,4
+isnorth240226A,red,north beach,Eilat,In,29.5343,34.952233,24/02/2026,10:20,1,107,22,corals,consolidated,Hard,4
+isnorth240226B,red,north beach,Eilat,Out,29.5301,34.96705,24/02/2026,11:32,1,117,22,corals,consolidated,Hard,4
+iswest040526A,red,west beach,Princess,Out,29.495367,34.9188,04/05/2026,09:50,1,97,23,sand & corals,unconsolidated,Mixed,2
+iswest040526B,red,west beach,Princess,In,29.492333,34.915017,04/05/2026,11:16,1,90,23,corals,consolidated,Hard,4
+iswest030626A,red,west beach,Shlomo,In,29.512983,34.932167,03/06/2026,17:08,1,100,23,sand & corals,unconsolidated,Mixed,3
+iswest250626A,red,west beach,Shlomo,In,29.510533,34.935367,25/06/2026,09:05,1,200,22,sand,consolidated,Soft,0
+iswest070726A,red,west beach,Shlomo,In,29.512467,34.936617,07/07/2026,13:05,1,190,22,sand,consolidated,Soft,0
+iswest130826A,red,west beach,Princess,In,29.49108333,34.91895,13/08/2026,14:07,1,190,22,sand & corals,unconsolidated,Mixed,1
+iswest130826B,red,west beach,Princess,In,29.49133333,34.92005,13/08/2026,15:38,1,230,22,sand,consolidated,Soft,0
+iswest130826C,red,west beach,Princess,Out,29.49321667,34.92173333,13/08/2026,14:28,1,193,22,sand,consolidated,Soft,0
