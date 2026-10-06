@@ -1,0 +1,1054 @@
+---
+title: "Script 3 – Fish community and environment (Figures 6, 7, 8, S4, S5)"
+author: "Almog Haim – MEDsLab, Bar-Ilan University"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# Overview
+
+This script analyses the BRUVS fish data together with the environmental data
+of each deployment, starting from the two raw tables, and reproduces:
+
+| Figure | Content |
+|---|---|
+| 6  | Sample-based species rarefaction curves, inside vs. outside the canyons |
+| 7  | GAMs – species richness and total MaxN by location (In / Out) |
+| 8  | GAMs – species richness and total MaxN by canyon |
+| S4 | Substrate type by depth range in each canyon |
+| S5 | Redundancy analysis (RDA) of the fish community |
+
+The script also runs the model diagnostics reported in the article
+(`gam.check()` and DHARMa residual tests, Section 4.3).
+
+Code consolidated from the original BRUVS analysis script.
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+library(tidyverse)   # dplyr, tidyr, ggplot2, readr, stringr, purrr
+library(vegan)       # specaccum, decostand, rda
+library(mgcv)        # GAMs
+library(DHARMa)      # simulation-based residual diagnostics of the GAMs
+library(ggrepel)     # non-overlapping labels in the RDA biplot
+library(patchwork)   # multi-panel figure assembly
+```
+
+# 1. Input files and settings
+
+All paths are relative to this script (the `scripts` folder); the input
+files are in `data/bruvs` and all outputs are written to `outputs`.
+
+```{r paths}
+data_dir    <- file.path("..", "data", "bruvs")
+fish_file   <- file.path(data_dir, "bruvs_maxn.csv")          # one row per taxon per deployment
+deploy_file <- file.path(data_dir, "bruvs_deployments.csv")   # one row per deployment
+
+# Output folder for figures, tables and the saved workspace
+out_dir <- file.path("..", "outputs")
+fig_dir <- out_dir
+dir.create(fig_dir, showWarnings = FALSE)
+
+missing <- c(fish_file, deploy_file)[!file.exists(c(fish_file, deploy_file))]
+if (length(missing) > 0) stop("Missing input file(s):\n", paste(missing, collapse = "\n"))
+```
+
+```{r settings}
+canyon_levels   <- c("Eilat", "Shlomo", "Princess")
+location_levels <- c("In", "Out")
+
+canyon_cols   <- c("Eilat" = "steelblue", "Shlomo" = "darkorange", "Princess" = "darkgreen")
+location_cols <- c("In" = "#d95f02", "Out" = "#7570b3")
+
+substrate_bin  <- 20    # depth bins of Figure S4 (m)
+rda_arrow_scale <- 1.4  # stretch of the arrows in the RDA biplot
+
+# ---------------------------------------------------------------------------
+# Figure style – used by every figure so that all figures look the same
+# (identical to Scripts 1 and 2)
+# ---------------------------------------------------------------------------
+# Font: Times New Roman, requested through R's generic "serif" family.
+# "serif" is understood by every R graphics device (screen, png, pdf,
+# cairo_pdf, ragg) and is drawn as Times New Roman on Windows (Times on
+# macOS). Asking for "Times New Roman" by name makes the standard pdf() and
+# png() devices fail silently, which produces empty files.
+font_family <- "serif"
+
+# Text sizes (pt) shared by all figures
+fig_sizes <- list(
+  axis_title   = 18,   # axis titles
+  axis_text    = 14,   # axis numbers
+  strip        = 16,   # panel title strips
+  legend_title = 16,
+  legend_text  = 14,
+  legend_key   = 1.3,  # size of the legend colour boxes (lines)
+  tag          = 18,   # panel letters
+  annotation   = 4.5   # text inside panels (mm, ggplot units)
+)
+
+theme_fig <- theme(
+  text         = element_text(family = font_family),
+  axis.title   = element_text(size = fig_sizes$axis_title),
+  axis.text    = element_text(size = fig_sizes$axis_text, colour = "black"),
+  strip.text   = element_text(size = fig_sizes$strip),
+  legend.title = element_text(size = fig_sizes$legend_title, face = "bold"),
+  legend.text  = element_text(size = fig_sizes$legend_text),
+  plot.tag     = element_text(size = fig_sizes$tag, face = "bold")
+)
+
+# Text drawn inside the panels (geom_text / geom_label) uses the same font
+update_geom_defaults("text",  list(family = font_family))
+update_geom_defaults("label", list(family = font_family))
+
+# Single y-axis title (left) and x-axis title (bottom) for a whole figure
+add_figure_titles <- function(panels, y = NULL, x = NULL, x_hjust = 0.5,
+                              size = fig_sizes$axis_title) {
+  wrap_elements(panel = panels) +
+    labs(tag = y, caption = x) +
+    theme(text              = element_text(family = font_family),
+          plot.tag          = element_text(angle = 90, size = size),
+          plot.tag.position = "left",
+          plot.caption      = element_text(size = size, hjust = x_hjust))
+}
+
+# Hide axis numbers but keep their space, so that panels stay evenly spaced
+hide_axis_text <- function(axis = c("x", "y")) {
+  axis <- match.arg(axis)
+  if (axis == "x") {
+    theme(axis.text.x = element_text(colour = "transparent"),
+          axis.ticks.x = element_line(colour = "transparent"))
+  } else {
+    theme(axis.text.y = element_text(colour = "transparent"),
+          axis.ticks.y = element_line(colour = "transparent"))
+  }
+}
+
+# Save a figure as PDF (vector, embedded font), 300-dpi PNG and 300-dpi TIFF.
+# Always pass the figure object explicitly: ggsave() without `plot =` saves
+# ggplot2's "last plot", which for a patchwork figure can be one of its
+# internal pieces (e.g. the empty legend panel).
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  has_ragg   <- requireNamespace("ragg", quietly = TRUE)
+  pdf_device <- if (capabilities("cairo")) cairo_pdf else "pdf"
+  files <- file.path(fig_dir, paste0(name, c(".pdf", ".png", ".tiff")))
+  start <- Sys.time() - 1
+
+  ggsave(files[1], plot, width = width, height = height, device = pdf_device)
+  ggsave(files[2], plot, width = width, height = height, dpi = dpi, bg = "white",
+         device = if (has_ragg) ragg::agg_png else "png")
+  ggsave(files[3], plot, width = width, height = height, dpi = dpi, bg = "white",
+         device = if (has_ragg) ragg::agg_tiff else "tiff", compression = "lzw")
+
+  # Windows cannot overwrite a file that is open in another program (image
+  # viewer, PDF reader, Explorer preview pane). Check that every file was
+  # really rewritten and say so if not.
+  not_updated <- files[is.na(file.mtime(files)) | file.mtime(files) < start]
+  if (length(not_updated) > 0) {
+    warning("Not updated (probably open in another program - close it and run again):\n  ",
+            paste(not_updated, collapse = "\n  "), call. = FALSE)
+  } else {
+    message("Saved: ", paste(basename(files), collapse = ", "))
+  }
+
+  set_last_plot(plot)   # so that a later ggsave() without `plot =` also saves this figure
+  invisible(plot)
+}
+
+# Panel letters in the top-left corner of each panel
+tag_inside <- function(x = 0.01, y = 0.99, size = fig_sizes$tag) {
+  theme(plot.tag = element_text(size = size, face = "bold"), plot.tag.position = c(x, y))
+}
+
+# Axis labels with at most two decimals, trailing zeros dropped
+label_2dec  <- function(x) sub("\\.?0+$", "", sprintf("%.2f", x))
+
+# Legend drawn from a separate, otherwise empty plot, so that it appears once
+# and looks the same in every ggplot2 version
+# `scale` enlarges text and keys (e.g. 1.25 = 25 % larger than the default)
+legend_panel <- function(p, scale = 1) {
+  wrap_elements(full = p + theme_void() +
+    theme(legend.position = "left",
+          legend.key.size = unit(fig_sizes$legend_key * scale, "lines"),
+          text         = element_text(family = font_family),
+          legend.title = element_text(face = "bold", size = fig_sizes$legend_title * scale),
+          legend.text  = element_text(size = fig_sizes$legend_text * scale)))
+}
+
+theme_panel <- theme_classic() + theme_fig
+```
+
+# 2. Load and clean the data
+
+## 2.1 Fish observations
+
+```{r load-fish}
+fish_raw   <- read.csv(fish_file, check.names = FALSE)
+deploy_raw <- read.csv(deploy_file, check.names = FALSE)
+
+# Text clean-up: some species names contain non-breaking spaces
+# (e.g. "Choerodon robustus" typed twice, once with each kind of space),
+# which would turn one species into two different columns.
+clean_text <- function(x) na_if(str_squish(gsub(" ", " ", x)), "")
+
+fish <- fish_raw %>%
+  mutate(across(where(is.character), ~ iconv(.x, from = "", to = "UTF-8", sub = "")),
+         across(c(OpCode, Canyon, Location, Family, Species), clean_text)) %>%
+  filter(!is.na(OpCode), !is.na(MaxN), MaxN >= 0)   # empty deployments have no fish rows
+```
+
+## 2.2 Inside / outside the canyon (In / Out) of every deployment
+
+`Deploy_summary.csv` (column `Canyon_Location`) and `red_MaxN_data.csv`
+(column `Location`) both give the position of the deployment. When they
+disagree, the value in `red_MaxN_data.csv` is used. Positions can also be
+set by hand in `location_manual` (these override both files); it is empty,
+because the two files were checked and corrected and now agree. The script stops if a deployment is missing from one of the files
+or has more than one position in `red_MaxN_data.csv`.
+
+```{r location}
+# Manual corrections (none: both files were corrected and agree)
+location_manual <- tibble(OpCode = character(), Location_manual = character())
+
+location_check <- full_join(
+  deploy_raw %>% transmute(OpCode = clean_text(OpCode), Location_deploy = clean_text(Canyon_Location)),
+  fish_raw   %>% transmute(OpCode = clean_text(OpCode), Location_fish   = clean_text(Location)) %>%
+    filter(!is.na(OpCode)) %>% distinct(),
+  by = "OpCode")
+
+unclear <- location_check %>%
+  filter(is.na(Location_deploy) | is.na(Location_fish) |
+         OpCode %in% OpCode[duplicated(OpCode)])
+if (nrow(unclear) > 0) {
+  print(unclear)
+  stop("Unclear In/Out position for the deployments above - check the two files")
+}
+stopifnot(all(location_manual$OpCode %in% location_check$OpCode))
+
+location_table <- location_check %>%
+  left_join(location_manual, by = "OpCode") %>%
+  mutate(Location = coalesce(Location_manual, Location_fish),
+         Source   = case_when(!is.na(Location_manual)        ~ "manual correction",
+                              Location_deploy != Location_fish ~ "red_MaxN_data.csv (files disagree)",
+                              TRUE                             ~ "both files agree"))
+
+# Deployments where the two files disagree or a manual correction was used
+location_table %>% filter(Source != "both files agree") %>% knitr::kable()
+
+fish <- fish %>% select(-Location) %>% left_join(select(location_table, OpCode, Location), by = "OpCode")
+```
+
+## 2.3 One row per deployment
+
+Species richness = number of different taxa recorded in the deployment;
+total MaxN = sum of the MaxN of all taxa. Deployments without fish get 0.
+
+```{r deployments}
+fish_summary <- fish %>%
+  group_by(OpCode) %>%
+  summarise(Richness   = n_distinct(Species[MaxN > 0]),
+            Total_MaxN = sum(MaxN),
+            .groups = "drop")
+
+deployments <- deploy_raw %>%
+  transmute(OpCode = clean_text(OpCode),
+            Canyon = clean_text(Canyon),
+            depth       = suppressWarnings(as.numeric(depth)),
+            temperature = suppressWarnings(as.numeric(temperature)),
+            Substrate   = na_if(clean_text(Substrate), "na")) %>%
+  left_join(select(location_table, OpCode, Location), by = "OpCode") %>%
+  left_join(fish_summary, by = "OpCode") %>%
+  mutate(Richness   = replace_na(Richness, 0L),
+         Total_MaxN = replace_na(Total_MaxN, 0L),
+         Canyon     = factor(Canyon, levels = canyon_levels),
+         Location   = factor(Location, levels = location_levels),
+         Substrate  = factor(Substrate, levels = c("Hard", "Mixed", "Soft")))
+
+stopifnot(!anyNA(deployments$Canyon), !anyNA(deployments$Location))
+
+# Number of deployments
+deployments %>% count(Canyon, Location) %>%
+  pivot_wider(names_from = Location, values_from = n) %>% knitr::kable()
+```
+
+## 2.4 Community matrix
+
+Presence (1) / absence (0) of every species (records identified to species
+level) in every deployment, including the deployments without fish.
+
+```{r community}
+community <- fish %>%
+  filter(!is.na(Species), MaxN > 0) %>%
+  distinct(OpCode, Species) %>%
+  mutate(present = 1) %>%
+  pivot_wider(names_from = Species, values_from = present, values_fill = 0)
+
+community <- deployments %>% select(OpCode) %>%
+  left_join(community, by = "OpCode") %>%
+  mutate(across(-OpCode, ~ replace_na(.x, 0))) %>%
+  column_to_rownames("OpCode") %>%
+  as.matrix()
+
+stopifnot(identical(rownames(community), deployments$OpCode))
+cat(ncol(community), "species in", nrow(community), "deployments\n")
+```
+
+# 3. Figure 6 – sample-based species rarefaction curves
+
+Sample-based rarefaction curves (`vegan::specaccum(method = "exact")`): the
+expected number of species in a random subset of *m* deployments, computed
+analytically from the species incidences (presence/absence in each deployment)
+instead of averaging random orderings of the deployments (Colwell et al. 2004,
+Ecology 85: 2717–2727). Shading: ± 1.96 SD of the expected richness.
+The SD is unconditional (`conditioned = FALSE`): the observed deployments are
+treated as a sample from a larger assemblage, whose total richness is estimated
+with the Chao2 estimator (`gamma = "chao"`); therefore the SD does not shrink to
+zero at the full number of deployments.
+
+```{r fig6, fig.width=15, fig.height=6.5}
+rarefaction <- function(rows, ...) {
+  rc <- specaccum(community[rows, , drop = FALSE], method = "exact",
+                conditioned = FALSE, gamma = "chao")
+  tibble(Samples = rc$sites, Richness = rc$richness, SD = rc$sd, ...)
+}
+
+rare_all <- map_dfr(location_levels, function(l)
+  rarefaction(deployments$Location == l, Location = l))
+
+rare_canyon <- expand_grid(Canyon = canyon_levels, Location = location_levels) %>%
+  pmap_dfr(function(Canyon, Location)
+    rarefaction(deployments$Canyon == Canyon & deployments$Location == Location,
+                 Canyon = Canyon, Location = Location))
+
+# Number of deployments in each curve, written in the panel titles
+n_label <- function(d) paste0("In = ", sum(d$Location == "In"), ", Out = ", sum(d$Location == "Out"))
+strip_all    <- paste0("All canyons\n", n_label(deployments))
+strip_canyon <- deployments %>% group_by(Canyon) %>%
+  summarise(label = paste0(first(Canyon), "\nIn = ", sum(Location == "In"),
+                           ", Out = ", sum(Location == "Out")), .groups = "drop")
+
+rare_all    <- rare_all %>% mutate(Panel = strip_all)
+rare_canyon <- rare_canyon %>%
+  mutate(Canyon = factor(Canyon, levels = canyon_levels)) %>%
+  left_join(strip_canyon, by = "Canyon") %>%
+  mutate(Panel = factor(label, levels = strip_canyon$label))
+
+rarefaction_panel <- function(d) {
+  ggplot(d, aes(Samples, Richness, colour = Location, fill = Location)) +
+    geom_ribbon(aes(ymin = pmax(0, Richness - 1.96 * SD), ymax = Richness + 1.96 * SD),
+                alpha = 0.18, colour = NA) +
+    geom_line(linewidth = 1.2) +
+    facet_wrap(~ Panel, nrow = 1) +
+    scale_colour_manual(values = location_cols, guide = "none") +
+    scale_fill_manual(values = location_cols, guide = "none") +
+    scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.05))) +
+    labs(x = NULL, y = NULL) +
+    theme_panel +
+    theme(strip.background = element_rect(colour = "black", linewidth = 0.6))
+}
+
+p6A <- rarefaction_panel(rare_all)
+p6B <- rarefaction_panel(rare_canyon) +
+  scale_x_continuous(breaks = seq(0, 20, by = 4))
+
+legend_location <- legend_panel(
+  ggplot(tibble(Location = factor(location_levels, levels = location_levels), x = 0, y = 0),
+         aes(x, y, colour = Location, fill = Location)) +
+    geom_ribbon(aes(ymin = y, ymax = y), alpha = 0.18, colour = NA) +
+    geom_line(linewidth = 1.2, alpha = 0) +
+    scale_colour_manual(values = location_cols, name = "Location:",
+                        guide = guide_legend(override.aes = list(alpha = 1))) +
+    scale_fill_manual(values = location_cols, name = "Location:"),
+  scale = 1.2
+)
+
+figure6_panels <- p6A + p6B + legend_location +
+  plot_layout(widths = c(1, 2.1, 0.32)) +
+  plot_annotation(tag_levels = list(c("A", "B", ""))) &
+  tag_inside(0.005, 0.995)
+
+figure6 <- add_figure_titles(figure6_panels, y = "Expected species richness",
+                             x = "Number of deployments", x_hjust = 0.42)
+figure6
+
+save_figure(figure6, "Figure 6", width = 15, height = 6.5)
+```
+
+# 4. GAMs – species richness and total MaxN
+
+Species richness: Poisson GAM. Total MaxN: negative-binomial GAM (over-dispersed
+counts). All candidate models include canyon and location as fixed effects and
+smooth effects of depth and near-bottom temperature; they differ in whether
+the smooths are shared by all deployments or fitted separately for each
+location (`by = Location`) or each canyon (`by = Canyon`).
+
+## 4.1 Model selection (AIC)
+
+Every candidate model is fitted to the same data and compared with `AIC()`,
+together with a null model (intercept only, `model_*_0`) that shows whether
+the explanatory variables explain the response at all. The models used in
+the article are set in `use_richness_model` / `use_maxn_model` (the
+lowest-AIC candidate models); the script warns if another candidate model
+has a lower AIC.
+
+Note on `R-sq.(adj)` in `summary()`: for count models mgcv computes it from
+the raw residuals (observed − fitted), so a few very large counts can make it
+negative. For Poisson / negative-binomial GAMs the deviance explained is the
+usual measure; both are given in the AIC table.
+
+```{r model-selection-richness}
+# --- Species richness (Poisson) ---------------------------------------------
+model_richness_1 <- gam(
+  Richness ~ Canyon + Location +
+    s(depth, k = 5) +
+    s(temperature, k = 5),
+  family = poisson(), data = deployments, method = "REML")
+
+model_richness_2 <- gam(
+  Richness ~ Canyon + Location +
+    s(depth, by = Canyon, k = 5) +
+    s(temperature, by = Canyon, k = 5),
+  family = poisson(), data = deployments, method = "REML")
+
+model_richness_3 <- gam(
+  Richness ~ Canyon + Location +
+    s(depth, by = Location, k = 5) +
+    s(temperature, by = Location, k = 5),
+  family = poisson(), data = deployments, method = "REML")
+
+model_richness_0 <- gam(Richness ~ 1, family = poisson(), data = deployments, method = "REML")
+
+# AIC of the species-richness models
+aic_richness <- AIC(model_richness_0, model_richness_1, model_richness_2, model_richness_3)
+aic_richness
+```
+
+```{r model-selection-maxn}
+# --- Total MaxN (negative binomial) -----------------------------------------
+model_maxn_1 <- gam(
+  Total_MaxN ~ Canyon + Location +
+    s(depth, by = Canyon, k = 5) +
+    s(temperature, by = Canyon, k = 5),
+  family = nb(), data = deployments, method = "REML")
+
+model_maxn_2 <- gam(
+  Total_MaxN ~ Canyon + Location +
+    s(depth, by = Location, k = 5) +
+    s(temperature, k = 5),
+  family = nb(), data = deployments, method = "REML")
+
+model_maxn_3 <- gam(
+  Total_MaxN ~ Canyon + Location +
+    s(depth, by = Location, k = 5) +
+    s(temperature, by = Location, k = 5),
+  family = nb(), data = deployments, method = "REML")
+
+model_maxn_4 <- gam(
+  Total_MaxN ~ Canyon + Location +
+    s(depth, k = 5) +
+    s(temperature, k = 5),
+  family = nb(), data = deployments, method = "REML")
+
+model_maxn_0 <- gam(Total_MaxN ~ 1, family = nb(), data = deployments, method = "REML")
+# AIC of the total-MaxN models
+aic_maxn <- AIC(model_maxn_0, model_maxn_1, model_maxn_2, model_maxn_3, model_maxn_4)
+aic_maxn
+```
+
+```{r model-selection-table}
+# Models chosen for the article (the lowest-AIC candidate models). Set to NULL
+# to use the lowest-AIC candidate model automatically.
+use_richness_model <- "model_richness_3"
+use_maxn_model     <- "model_maxn_4"
+
+# AIC table with delta AIC, Akaike weight, deviance explained and R-sq.(adj)
+aic_summary <- function(aic, response, env = parent.frame()) {
+  as_tibble(aic, rownames = "Model") %>%
+    mutate(Response = response,
+           Formula  = map_chr(Model, ~ paste(deparse(formula(get(.x, envir = env)), width.cutoff = 500), collapse = "")),
+           Deviance_explained = map_dbl(Model, ~ summary(get(.x, envir = env))$dev.expl),
+           R_sq_adj = map_dbl(Model, ~ summary(get(.x, envir = env))$r.sq),
+           Delta_AIC  = AIC - min(AIC),
+           AIC_weight = exp(-Delta_AIC / 2) / sum(exp(-Delta_AIC / 2))) %>%
+    relocate(Response, Model) %>%
+    arrange(AIC)
+}
+
+aic_table <- bind_rows(aic_summary(aic_richness, "Species richness"),
+                       aic_summary(aic_maxn,     "Total MaxN"))
+aic_table %>% select(-Formula) %>% knitr::kable(digits = 3)
+write_csv(aic_table, file.path(fig_dir, "Table_GAM_AIC.csv"))
+
+# Lowest-AIC candidate model (the null models are not candidates)
+best_candidate <- function(aic) {
+  aic <- aic[!grepl("_0$", rownames(aic)), ]
+  rownames(aic)[which.min(aic$AIC)]
+}
+selected_richness <- use_richness_model %||% best_candidate(aic_richness)
+selected_maxn     <- use_maxn_model     %||% best_candidate(aic_maxn)
+
+for (sel in list(c(selected_richness, best_candidate(aic_richness)),
+                 c(selected_maxn,     best_candidate(aic_maxn))))
+  if (sel[1] != sel[2]) warning(sel[1], " is used, but ", sel[2], " has a lower AIC", call. = FALSE)
+
+# Is the selected model better than the null model?
+for (x in list(list(aic_richness, selected_richness, "model_richness_0"),
+               list(aic_maxn,     selected_maxn,     "model_maxn_0"))) {
+  d_aic <- x[[1]][x[[2]], "AIC"] - x[[1]][x[[3]], "AIC"]
+  cat(sprintf("%s: AIC %.1f %s the null model\n", x[[2]], abs(d_aic),
+              if (d_aic < 0) "lower (better) than" else "HIGHER (worse) than"))
+}
+
+model_richness <- get(selected_richness)
+model_maxn     <- get(selected_maxn)
+
+cat("Species richness model used:", selected_richness, "\n ", deparse(formula(model_richness), 500), "\n")
+cat("Total MaxN model used:      ", selected_maxn,     "\n ", deparse(formula(model_maxn), 500), "\n")
+```
+
+## 4.2 Selected models
+
+```{r gams}
+summary(model_richness)
+concurvity(model_richness)
+summary(model_maxn)
+concurvity(model_maxn)
+```
+
+## 4.3 Model diagnostics
+
+Diagnostics of the two models used in the article (Methods: "Model adequacy
+was evaluated through inspection of convergence, residual patterns, effective
+degrees of freedom, and the k-index using gam.check() … Simulation-based
+residual diagnostics were additionally performed using the DHARMa package …
+including tests for dispersion, residual uniformity, zero inflation, and
+outliers").
+
+**mgcv checks.** `gam.check()` prints the convergence of the REML
+optimisation and, for every smooth, the basis dimension (k'), the effective
+degrees of freedom (edf) and the k-index with its p-value (a low k-index with
+a small p-value suggests that k is too small), and draws the standard residual
+plots. The same numbers are collected in a table with `k.check()`.
+
+```{r diagnostics-mgcv, fig.width=9, fig.height=8}
+set.seed(5)   # the k-index p-values are based on random permutations
+
+cat("--- Species richness model:", selected_richness, "---\n")
+par(mfrow = c(2, 2))
+gam.check(model_richness, rep = 500)
+
+cat("\n--- Total MaxN model:", selected_maxn, "---\n")
+par(mfrow = c(2, 2))
+gam.check(model_maxn, rep = 500)
+par(mfrow = c(1, 1))
+
+# Convergence and basis-dimension checks in one table
+k_table <- function(model, response) {
+  as_tibble(k.check(model), rownames = "Term") %>%
+    transmute(Response = response, Term,
+              k_prime = `k'`, edf, k_index = `k-index`, p_value = `p-value`,
+              Converged = model$converged,
+              REML_convergence = model$outer.info$conv)
+}
+diagnostics_k <- bind_rows(k_table(model_richness, "Species richness"),
+                           k_table(model_maxn,     "Total MaxN"))
+diagnostics_k %>% knitr::kable(digits = 3)
+```
+
+**DHARMa checks.** Scaled (quantile) residuals are obtained by simulating
+new response values from each fitted model (1000 simulations): Poisson for
+species richness and negative binomial, with the estimated dispersion
+parameter (theta), for total MaxN. The simulations are drawn directly from the
+fitted means, so that the same procedure is used for both families, and are
+passed to DHARMa with `createDHARMa()`. If a model fits well, the scaled
+residuals are uniformly distributed between 0 and 1. The tests are:
+dispersion (`testDispersion`), uniformity of the residuals
+(`testUniformity`, Kolmogorov–Smirnov), excess zeros (`testZeroInflation`)
+and outliers (`testOutliers`, bootstrap). The residuals are also plotted
+against the fitted values and against every predictor.
+
+```{r diagnostics-dharma, fig.width=10, fig.height=5}
+n_sim <- 1000
+
+# Simulated responses (one column per simulation) from a Poisson or
+# negative-binomial GAM
+simulate_gam <- function(model, n_sim) {
+  mu  <- fitted(model)
+  fam <- model$family$family
+  if (fam == "poisson") {
+    replicate(n_sim, rpois(length(mu), mu))
+  } else if (startsWith(fam, "Negative Binomial")) {
+    theta <- model$family$getTheta(TRUE)
+    replicate(n_sim, rnbinom(length(mu), mu = mu, size = theta))
+  } else {
+    stop("simulate_gam(): family not supported: ", fam)
+  }
+}
+
+dharma_residuals <- function(model, seed) {
+  set.seed(seed)
+  createDHARMa(simulatedResponse      = simulate_gam(model, n_sim),
+               observedResponse       = model$y,
+               fittedPredictedResponse = fitted(model),
+               integerResponse        = TRUE)
+}
+
+res_richness <- dharma_residuals(model_richness, seed = 6)
+res_maxn     <- dharma_residuals(model_maxn,     seed = 7)
+
+# Residual plots: QQ plot with tests (left) and residuals vs. fitted values (right),
+# then residuals against each predictor (data of the model, same row order)
+residual_plots <- function(res, model, title) {
+  plot(res, title = title)
+  mf <- model$model
+  par(mfrow = c(2, 2))
+  plotResiduals(res, form = mf$depth,       xlab = "Depth (m)",       main = "Depth")
+  plotResiduals(res, form = mf$temperature, xlab = "Temperature (°C)", main = "Temperature")
+  plotResiduals(res, form = mf$Location,    xlab = "Location",        main = "Location")
+  plotResiduals(res, form = mf$Canyon,      xlab = "Canyon",          main = "Canyon")
+  par(mfrow = c(1, 1))
+}
+residual_plots(res_richness, model_richness, "Species richness")
+residual_plots(res_maxn,     model_maxn,     "Total MaxN")
+
+# Test results in one table
+dharma_tests <- function(res, response) {
+  tests <- list(
+    "Dispersion"           = testDispersion(res, plot = FALSE),
+    "Uniformity (KS)"      = testUniformity(res, plot = FALSE),
+    "Zero inflation"       = testZeroInflation(res, plot = FALSE),
+    "Outliers (bootstrap)" = testOutliers(res, type = "bootstrap", plot = FALSE)
+  )
+  tibble(Response  = response,
+         Test      = names(tests),
+         Statistic = map_dbl(tests, ~ unname(.x$statistic[1])),
+         p_value   = map_dbl(tests, "p.value"))
+}
+diagnostics_dharma <- bind_rows(dharma_tests(res_richness, "Species richness"),
+                                dharma_tests(res_maxn,     "Total MaxN"))
+diagnostics_dharma %>% knitr::kable(digits = 3)
+
+write_csv(diagnostics_k,      file.path(fig_dir, "Table_GAM_diagnostics_k.csv"))
+write_csv(diagnostics_dharma, file.path(fig_dir, "Table_GAM_diagnostics_DHARMa.csv"))
+```
+
+```
+
+## 4.4 Model predictions
+
+```{r prediction-functions}
+# Model predictions on the response scale, with 95 % confidence intervals.
+# type = "average":  prediction averaged over all deployments, with the focal
+#                    variables set to the given values (= ggeffects
+#                    predict_response(margin = "empirical")); delta-method CI.
+# type = "marginal": prediction at the mean of the other numeric variable,
+#                    averaged with equal weights over the levels of the other
+#                    factor(s) on the link scale (= ggeffects
+#                    predict_response(margin = "marginalmeans", weights =
+#                    "equal")); CI from the t distribution with the residual
+#                    degrees of freedom, back-transformed.
+# Both reproduce the values of the original script (ggeffects) exactly.
+model_predictions <- function(model, data, x_var, x_values, by_var,
+                              by_levels = levels(data[[by_var]]),
+                              type = c("average", "marginal")) {
+  type <- match.arg(type)
+  b <- coef(model); V <- vcov(model)
+  inv <- model$family$linkinv; mu_eta <- model$family$mu.eta
+  vars    <- all.vars(formula(model))[-1]
+  factors <- vars[sapply(data[vars], is.factor)]
+  numeric <- setdiff(vars, factors)
+
+  if (type == "marginal") {
+    other_f <- setdiff(factors, by_var)
+    base <- expand_grid(!!!lapply(set_names(other_f), function(v) levels(data[[v]])))
+    for (v in setdiff(numeric, x_var)) base[[v]] <- mean(data[[v]], na.rm = TRUE)
+    for (v in other_f) base[[v]] <- factor(base[[v]], levels = levels(data[[v]]))
+  }
+
+  map_dfr(by_levels, function(g) map_dfr(x_values, function(x) {
+    nd <- if (type == "average") data else base
+    nd[[x_var]]  <- x
+    nd[[by_var]] <- factor(g, levels = levels(data[[by_var]]))
+    X <- predict(model, newdata = nd, type = "lpmatrix")
+    if (type == "average") {
+      eta  <- drop(X %*% b)
+      est  <- mean(inv(eta))
+      grad <- colMeans(X * mu_eta(eta))
+      se   <- sqrt(drop(grad %*% V %*% grad))
+      tibble(x = x, group = g, predicted = est,
+             conf.low = est - 1.96 * se, conf.high = est + 1.96 * se)
+    } else {
+      xbar <- colMeans(X)
+      eta  <- sum(xbar * b)
+      se   <- sqrt(drop(xbar %*% V %*% xbar))
+      q    <- qt(0.975, df.residual(model))
+      tibble(x = x, group = g, predicted = inv(eta),
+             conf.low = inv(eta - q * se), conf.high = inv(eta + q * se))
+    }
+  })) %>% mutate(group = factor(group, levels = by_levels))
+}
+
+# Difference in the average prediction between each level of `variable` and
+# the reference level, with 95 % CI (= marginaleffects::avg_comparisons(type =
+# "response"))
+level_differences <- function(model, data, variable,
+                              reference = levels(data[[variable]])[1]) {
+  b <- coef(model); V <- vcov(model)
+  inv <- model$family$linkinv; mu_eta <- model$family$mu.eta
+  lv <- levels(data[[variable]])
+  average_at <- function(level) {
+    nd <- data; nd[[variable]] <- factor(level, levels = lv)
+    X <- predict(model, newdata = nd, type = "lpmatrix"); eta <- drop(X %*% b)
+    list(est = mean(inv(eta)), grad = colMeans(X * mu_eta(eta)))
+  }
+  ref <- average_at(reference)
+  map_dfr(lv, function(l) {
+    a <- average_at(l); d <- a$est - ref$est; g <- a$grad - ref$grad
+    se <- sqrt(drop(g %*% V %*% g))
+    tibble(level = l, estimate = d, conf.low = d - 1.96 * se, conf.high = d + 1.96 * se)
+  }) %>%
+    mutate(across(c(estimate, conf.low, conf.high), ~ if_else(level == reference, 0, .x)),
+           level = factor(level, levels = lv))
+}
+```
+
+```{r predictions}
+d <- deployments
+grid200 <- function(x) seq(min(x, na.rm = TRUE), max(x, na.rm = TRUE), length.out = 200)
+
+# --- Species richness: all observed depths / temperatures (as in the original)
+rich_depth_location <- model_predictions(model_richness, d, "depth", sort(unique(d$depth)), "Location")
+rich_temp_location  <- model_predictions(model_richness, d, "temperature", sort(unique(d$temperature)), "Location")
+rich_depth_canyon   <- model_predictions(model_richness, d, "depth", sort(unique(d$depth)), "Canyon")
+rich_temp_canyon    <- model_predictions(model_richness, d, "temperature", sort(unique(d$temperature)), "Canyon")
+
+# --- Total MaxN: depth limited to the range sampled by each group
+#     by location: the depth range of the In and of the Out deployments
+maxn_depth_location <- map_dfr(location_levels, function(l)
+  model_predictions(model_maxn, d, "depth", grid200(d$depth[d$Location == l]),
+                    "Location", by_levels = l, type = "marginal")) %>%
+  mutate(group = factor(group, levels = location_levels))
+
+#     by canyon: the depth range shared by the In and Out deployments of all canyons
+depth_overlap <- d %>%
+  group_by(Canyon, Location) %>%
+  summarise(min_depth = min(depth), max_depth = max(depth), .groups = "drop") %>%
+  group_by(Canyon) %>%
+  summarise(overlap_min = max(min_depth), overlap_max = min(max_depth), .groups = "drop")
+depth_common <- seq(max(depth_overlap$overlap_min), min(depth_overlap$overlap_max), length.out = 200)
+
+maxn_depth_canyon  <- model_predictions(model_maxn, d, "depth", depth_common, "Canyon", type = "marginal")
+maxn_temp_location <- model_predictions(model_maxn, d, "temperature", grid200(d$temperature), "Location", type = "marginal")
+maxn_temp_canyon   <- model_predictions(model_maxn, d, "temperature", grid200(d$temperature), "Canyon", type = "marginal")
+
+# --- Differences: Out vs. In, and Shlomo / Princess vs. Eilat
+diff_rich_location <- level_differences(model_richness, d, "Location", "In")
+diff_maxn_location <- level_differences(model_maxn,     d, "Location", "In")
+diff_rich_canyon   <- level_differences(model_richness, d, "Canyon",   "Eilat")
+diff_maxn_canyon   <- level_differences(model_maxn,     d, "Canyon",   "Eilat")
+
+bind_rows(
+  diff_rich_location %>% mutate(Response = "Species richness"),
+  diff_maxn_location %>% mutate(Response = "Total MaxN"),
+  diff_rich_canyon   %>% mutate(Response = "Species richness"),
+  diff_maxn_canyon   %>% mutate(Response = "Total MaxN")
+) %>% relocate(Response) %>% knitr::kable(digits = 3)
+```
+
+```{r export-tables}
+gam_table <- function(model, response) {
+  s <- summary(model)
+  bind_rows(
+    as_tibble(s$p.table, rownames = "Term") %>%
+      transmute(Response = response, Term, Type = "parametric",
+                Estimate, SE = `Std. Error`, Statistic = `z value`, p = `Pr(>|z|)`),
+    as_tibble(s$s.table, rownames = "Term") %>%
+      transmute(Response = response, Term, Type = "smooth",
+                edf, Ref.df, Statistic = Chi.sq, p = `p-value`)
+  ) %>% mutate(Deviance_explained = s$dev.expl, n = s$n)
+}
+
+write_csv(bind_rows(gam_table(model_richness, "Species richness"),
+                    gam_table(model_maxn, "Total MaxN"),
+                    gam_table(maxn_models_sens[[selected_maxn]],
+                              "Total MaxN (without extreme counts)")),
+          file.path(fig_dir, "Table_GAM_summaries.csv"))
+
+write_csv(bind_rows(
+  diff_rich_location %>% mutate(Response = "Species richness", Comparison = "vs In"),
+  diff_maxn_location %>% mutate(Response = "Total MaxN",       Comparison = "vs In"),
+  diff_rich_canyon   %>% mutate(Response = "Species richness", Comparison = "vs Eilat"),
+  diff_maxn_canyon   %>% mutate(Response = "Total MaxN",       Comparison = "vs Eilat")),
+  file.path(fig_dir, "Table_GAM_differences.csv"))
+
+write_csv(location_table, file.path(fig_dir, "Table_deployment_location.csv"))
+```
+
+## 4.5 Figure panels
+
+```{r gam-panels}
+# Predicted response (line + 95 % CI) with the observed deployments (points)
+prediction_panel <- function(pred, x_var, y_var, by_var, cols, jitter = FALSE) {
+  set.seed(2)   # reproducible jitter of the points
+  ggplot() +
+    geom_ribbon(data = pred, aes(x = x, ymin = conf.low, ymax = conf.high, fill = group),
+                alpha = 0.18, colour = NA) +
+    geom_line(data = pred, aes(x = x, y = predicted, colour = group), linewidth = 1.2) +
+    geom_point(data = deployments,
+               aes(x = .data[[x_var]], y = .data[[y_var]], colour = .data[[by_var]]),
+               position = if (jitter) position_jitter(width = 0.03, height = 0) else "identity",
+               size = 2.3, alpha = 0.55) +
+    scale_colour_manual(values = cols, guide = "none") +
+    scale_fill_manual(values = cols, guide = "none") +
+    scale_y_continuous(labels = label_2dec) +
+    theme_panel
+}
+
+# Difference from the reference level (thick bar) with 95 % CI (error bar)
+difference_panel <- function(diffs, cols) {
+  ggplot(diffs, aes(x = level, colour = level)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.7) +
+    geom_errorbar(data = filter(diffs, conf.low != conf.high),
+                  aes(ymin = conf.low, ymax = conf.high), width = 0.5, linewidth = 1.1, alpha = 0.6) +
+    geom_errorbar(aes(ymin = estimate, ymax = estimate), width = 0.8, linewidth = 2.6) +
+    scale_colour_manual(values = cols, guide = "none") +
+    scale_x_discrete(limits = levels(diffs$level)) +   # reference level first
+    scale_y_continuous(labels = label_2dec) +
+    theme_panel
+}
+
+# Legend: line, CI band and point, as in the panels
+prediction_legend <- function(levels, cols, title) {
+  legend_panel(
+    ggplot(tibble(g = factor(levels, levels = levels), x = 0, y = 0),
+           aes(x, y, colour = g, fill = g)) +
+      geom_ribbon(aes(ymin = y, ymax = y), alpha = 0.18, colour = NA) +
+      geom_line(linewidth = 1.2, alpha = 0) +
+      geom_point(size = 2.3, alpha = 0) +
+      scale_colour_manual(values = cols, name = title,
+                          guide = guide_legend(override.aes = list(alpha = 1))) +
+      scale_fill_manual(values = cols, name = title),
+    scale = 1.2)
+}
+
+# Six panels (2 rows x 3 columns) + legend; the two prediction panels of a row
+# share the y axis, the panels of a column share the x axis
+gam_figure <- function(rich_depth, rich_temp, rich_diff, maxn_depth, maxn_temp, maxn_diff,
+                       by_var, cols, legend_title, diff_xlab) {
+  row_limits <- function(preds, y_var)
+    range(0, deployments[[y_var]], unlist(map(preds, ~ c(.x$conf.low, .x$conf.high))))
+  ylim_rich <- row_limits(list(rich_depth, rich_temp), "Richness")
+  ylim_maxn <- row_limits(list(maxn_depth, maxn_temp), "Total_MaxN")
+  xlim_depth <- range(deployments$depth)
+  xlim_temp  <- range(deployments$temperature) + c(-0.1, 0.1)
+
+  pA <- prediction_panel(rich_depth, "depth", "Richness", by_var, cols) +
+    coord_cartesian(xlim = xlim_depth, ylim = ylim_rich) +
+    labs(x = NULL, y = "Predicted species richness") + hide_axis_text("x")
+  pB <- prediction_panel(rich_temp, "temperature", "Richness", by_var, cols, jitter = TRUE) +
+    coord_cartesian(xlim = xlim_temp, ylim = ylim_rich) +
+    labs(x = NULL, y = NULL) + hide_axis_text("x") + hide_axis_text("y")
+  pC <- difference_panel(rich_diff, cols) +
+    labs(x = NULL, y = "Difference in species richness") + hide_axis_text("x")
+  pD <- prediction_panel(maxn_depth, "depth", "Total_MaxN", by_var, cols) +
+    coord_cartesian(xlim = xlim_depth, ylim = ylim_maxn) +
+    labs(x = "Depth (m)", y = "Predicted total MaxN")
+  pE <- prediction_panel(maxn_temp, "temperature", "Total_MaxN", by_var, cols, jitter = TRUE) +
+    coord_cartesian(xlim = xlim_temp, ylim = ylim_maxn) +
+    labs(x = "Near-bottom temperature (°C)", y = NULL) + hide_axis_text("y")
+  pF <- difference_panel(maxn_diff, cols) +
+    labs(x = diff_xlab, y = "Difference in total MaxN")
+
+  (pA + pB + pC + pD + pE + pF + plot_layout(ncol = 3)) |
+    prediction_legend(levels(deployments[[by_var]]), cols, legend_title)
+}
+
+finish_gam_figure <- function(fig) {
+  fig + plot_layout(widths = c(1, 0.16)) +
+    plot_annotation(tag_levels = list(c(LETTERS[1:6], ""))) &
+    tag_inside(0.01, 0.99)
+}
+```
+
+# 5. Figure 7 – GAMs by location (In / Out)
+
+```{r fig7, fig.width=16, fig.height=10}
+figure7 <- finish_gam_figure(gam_figure(
+  rich_depth_location, rich_temp_location, diff_rich_location,
+  maxn_depth_location, maxn_temp_location, diff_maxn_location,
+  by_var = "Location", cols = location_cols, legend_title = "Location:",
+  diff_xlab = "Location"))
+figure7
+
+save_figure(figure7, "Figure 7", width = 16, height = 10)
+```
+
+# 6. Figure 8 – GAMs by canyon
+
+```{r fig8, fig.width=16, fig.height=10}
+figure8 <- finish_gam_figure(gam_figure(
+  rich_depth_canyon, rich_temp_canyon, diff_rich_canyon,
+  maxn_depth_canyon, maxn_temp_canyon, diff_maxn_canyon,
+  by_var = "Canyon", cols = canyon_cols, legend_title = "Canyon:",
+  diff_xlab = "Canyon"))
+figure8
+
+save_figure(figure8, "Figure 8", width = 16, height = 10)
+```
+
+# 7. Figure S4 – substrate type by depth
+
+Frequency of occurrence = proportion of the deployments of a depth range in
+which the substrate type was recorded; n = number of deployments.
+
+```{r figS4, fig.width=13, fig.height=6}
+# Depth bins of 20 m; a depth equal to a bin limit belongs to the lower bin
+bin_breaks <- seq(floor(min(deployments$depth) / substrate_bin) * substrate_bin,
+                  ceiling(max(deployments$depth) / substrate_bin) * substrate_bin,
+                  by = substrate_bin)
+
+substrate <- deployments %>%
+  filter(!is.na(Substrate), !is.na(depth)) %>%
+  mutate(bin_index = as.integer(cut(depth, breaks = bin_breaks, include.lowest = TRUE)),
+         bin_low   = bin_breaks[bin_index],
+         depth_bin = paste0(bin_low, "–", bin_low + substrate_bin))
+
+substrate_n <- substrate %>% count(Canyon, bin_low, depth_bin, name = "n_deployments")
+
+substrate_summary <- substrate %>%
+  count(Canyon, bin_low, depth_bin, Substrate, name = "n_occurrence") %>%
+  left_join(substrate_n, by = c("Canyon", "bin_low", "depth_bin")) %>%
+  mutate(occurrence = n_occurrence / n_deployments)
+
+bin_order <- substrate_n %>% distinct(bin_low, depth_bin) %>% arrange(bin_low) %>% pull(depth_bin)
+substrate_summary <- substrate_summary %>% mutate(depth_bin = factor(depth_bin, levels = bin_order))
+substrate_n       <- substrate_n       %>% mutate(depth_bin = factor(depth_bin, levels = bin_order))
+
+# Substrate types on rows 1-3; the number of deployments of each depth range
+# is written in an extra bottom row labelled "n ="
+substrate_levels <- levels(substrate_summary$Substrate)
+n_row <- 0.25
+
+figureS4 <- ggplot(substrate_summary,
+                   aes(depth_bin, as.integer(Substrate))) +
+  geom_hline(yintercept = seq_along(substrate_levels), colour = "grey92", linewidth = 0.5) +
+  geom_hline(yintercept = 0.6, colour = "grey60", linewidth = 0.4) +
+  geom_point(aes(size = occurrence), colour = "grey20", alpha = 0.85) +
+  geom_text(data = substrate_n, aes(depth_bin, y = n_row, label = n_deployments),
+            size = fig_sizes$annotation + 0.5, inherit.aes = FALSE) +
+  facet_grid(~ Canyon, scales = "free_x", space = "free_x") +
+  scale_size_continuous(name = "Frequency of\noccurrence:", limits = c(0, 1),
+                        breaks = c(0.25, 0.5, 0.75, 1), range = c(2, 9),
+                        labels = scales::percent_format()) +
+  scale_y_continuous(breaks = c(n_row, seq_along(substrate_levels)),
+                     labels = c("n =", substrate_levels),
+                     limits = c(n_row - 0.3, length(substrate_levels) + 0.5),
+                     expand = expansion(0)) +
+  labs(x = "Depth range (m)", y = "Substrate type") +
+  theme_bw() + theme_fig +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        strip.background = element_rect(fill = "white", colour = "black", linewidth = 0.6),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.key.size = unit(fig_sizes$legend_key, "lines"))
+figureS4
+
+save_figure(figureS4, "Figure S4", width = 13, height = 6)
+```
+
+# 8. Figure S5 – redundancy analysis (RDA)
+
+Community: presence/absence of species, Hellinger-transformed. Explanatory
+variables: near-bottom temperature, depth and substrate type. Deployments
+without fish or with a missing variable are excluded.
+
+```{r rda}
+rda_rows <- complete.cases(deployments[, c("depth", "temperature", "Substrate")]) &
+            rowSums(community) > 0
+rda_data <- deployments[rda_rows, ]
+community_hellinger <- decostand(community[rda_rows, ], method = "hellinger")
+
+rda_model <- rda(community_hellinger ~ temperature + depth + Substrate, data = rda_data)
+rda_model
+set.seed(3)
+rda_test_overall <- anova(rda_model, permutations = 999)
+rda_test_terms   <- anova(rda_model, by = "margin", permutations = 999)
+rda_test_overall
+rda_test_terms
+vif.cca(rda_model)
+
+write_csv(bind_rows(
+  as_tibble(as.data.frame(rda_test_overall), rownames = "Term") %>% mutate(Test = "overall"),
+  as_tibble(as.data.frame(rda_test_terms),   rownames = "Term") %>% mutate(Test = "by margin")),
+  file.path(fig_dir, "Table_RDA_tests.csv"))
+```
+
+```{r figS5, fig.width=10, fig.height=9}
+site_scores <- as_tibble(scores(rda_model, display = "sites")) %>% bind_cols(rda_data)
+
+arrows_cont <- as.data.frame(scores(rda_model, display = "bp"))
+arrows_cont <- arrows_cont[rownames(arrows_cont) %in% c("depth", "temperature"), ]
+arrows_sub  <- as.data.frame(scores(rda_model, display = "cn"))
+env_arrows  <- bind_rows(arrows_cont, arrows_sub) %>%
+  rownames_to_column("Variable") %>%
+  mutate(Label = recode(Variable, depth = "Depth", temperature = "Temperature"),
+         Label = str_remove(Label, "^Substrate"),
+         RDA1  = RDA1 * rda_arrow_scale,
+         RDA2  = RDA2 * rda_arrow_scale)
+
+variance <- summary(rda_model)$cont$importance["Proportion Explained", c("RDA1", "RDA2")]
+axis_title <- function(axis) sprintf("%s (%.1f%%)", axis, 100 * variance[[axis]])
+
+location_lines <- c("In" = "solid", "Out" = "dashed")
+
+figureS5_plot <- ggplot(site_scores, aes(RDA1, RDA2)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey70") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey70") +
+  stat_ellipse(aes(group = Location, linetype = Location), data = filter(site_scores, Location == "In"),
+               colour = location_cols[["In"]], level = 0.95, linewidth = 0.8) +
+  stat_ellipse(aes(group = Location, linetype = Location), data = filter(site_scores, Location == "Out"),
+               colour = location_cols[["Out"]], level = 0.95, linewidth = 0.8) +
+  geom_point(aes(colour = Canyon, shape = Location), size = 3.5, alpha = 0.85) +
+  geom_segment(data = env_arrows, aes(x = 0, y = 0, xend = RDA1, yend = RDA2),
+               arrow = arrow(length = unit(0.22, "cm")), linewidth = 0.6, colour = "black") +
+  geom_text_repel(data = env_arrows, aes(RDA1, RDA2, label = Label), family = font_family,
+                  fontface = "bold", size = fig_sizes$annotation + 0.5, point.padding = 0.3,
+                  segment.colour = "grey60", segment.size = 0.3, max.overlaps = Inf, seed = 4) +
+  scale_colour_manual(values = canyon_cols, guide = "none") +
+  scale_shape_manual(values = c("In" = 16, "Out" = 17), guide = "none") +
+  scale_linetype_manual(values = location_lines, guide = "none") +
+  scale_x_continuous(labels = label_2dec) +
+  scale_y_continuous(labels = label_2dec) +
+  labs(x = axis_title("RDA1"), y = axis_title("RDA2")) +
+  theme_panel
+
+legend_rda <- legend_panel(
+  ggplot(tibble(Canyon   = factor(canyon_levels, levels = canyon_levels),
+                Location = factor(c("In", "Out", "Out"), levels = location_levels),
+                x = 0, y = 0), aes(x, y)) +
+    geom_point(aes(colour = Canyon), alpha = 0, size = 3.5) +
+    geom_point(aes(shape = Location), alpha = 0, size = 3.5) +
+    geom_line(aes(linetype = Location, group = Location), alpha = 0) +
+    scale_colour_manual(values = canyon_cols, name = "Canyon:",
+                        guide = guide_legend(order = 1, override.aes = list(alpha = 1, shape = 16))) +
+    scale_shape_manual(values = c("In" = 16, "Out" = 17), name = "Location:",
+                       guide = guide_legend(order = 2, override.aes = list(alpha = 1))) +
+    scale_linetype_manual(values = location_lines, name = "Ellipse (95%):",
+                          guide = guide_legend(order = 3, override.aes = list(
+                            alpha = 1, linewidth = 0.8, colour = unname(location_cols)))),
+  scale = 1.1)
+
+figureS5 <- figureS5_plot + legend_rda + plot_layout(widths = c(1, 0.25))
+figureS5
+
+save_figure(figureS5, "Figure S5", width = 10.5, height = 9)
+```
+
+# Save the workspace and the R session information
+
+```{r save-session}
+save.image(file = file.path(out_dir, "03_Bio_Environmental.RData"))
+sessionInfo()
+```

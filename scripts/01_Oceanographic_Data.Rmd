@@ -1,0 +1,1119 @@
+---
+title: "Script 1 – Near-bottom currents and temperature at the mooring stations (Figures 2–4, S1)"
+author: "Almog Haim – MEDsLab, Bar-Ilan University"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+# Overview
+
+This script reproduces **Figures 2, 3 and 4** and the supplementary
+**stick-plot figure** of the manuscript,
+starting from the **raw instrument files** (current meters and temperature
+loggers). No intermediate `.rds` / `.RData` files are used.
+
+| Figure | Content | Panels built here |
+|---|---|---|
+| 2 | Current speed densities with direction roses (downwelling / upwelling) | all |
+| 3 | Progressive vector diagrams (PVD) | all |
+| 4 | Cross-correlation (CCF) between along-flow velocity and temperature | all |
+| S1 (stick plots) | Current velocity stick plots of every station | all |
+
+Mooring deployments used:
+
+| Canyon | Station(s) | Bottom depth | Period (local time) |
+|---|---|---|---|
+| Shlomo | In / Out | 200 m | 18 Jun – 12 Aug 2026 |
+| Shlomo | In / Out | 100 m | 2 Jul – 12 Aug 2026 |
+| Shlomo | Continental shelf (SI) | 80 m | 2 Jun – 2 Jul 2026 |
+| Princess | In / Out | 100 m | 25 Jan – 1 Feb 2026 |
+| Eilat | In / Out | 100 m | 23 Feb – 13 Apr 2026 |
+
+Code was consolidated from the original analysis scripts of each
+mooring deployment.
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+library(tidyverse)   # dplyr, tidyr, ggplot2, readr, stringr, purrr
+library(lubridate)   # date-time parsing
+library(slider)      # moving-window smoothing of temperature
+library(zoo)         # rollmean() for CCF smoothing
+library(patchwork)   # multi-panel figure assembly
+
+TZ <- "Asia/Jerusalem"   # all instrument clocks are treated as local time
+```
+
+# 1. Input files and settings
+
+All paths are relative to this script (the `scripts` folder); the input
+files are in `data/moorings` and all outputs are written to `outputs`.
+
+```{r paths}
+mooring_dir <- file.path("..", "data", "moorings")
+
+files <- list(
+  # Shlomo canyon, 200 m deployment
+  shlomo_200 = list(
+    curr_in  = file.path(mooring_dir, "shlomo_200m_in_current.csv"),
+    curr_out = file.path(mooring_dir, "shlomo_200m_out_current.csv"),
+    temp_in  = file.path(mooring_dir, "shlomo_200m_in_temperature.csv"),
+    temp_out = file.path(mooring_dir, "shlomo_200m_out_temperature.csv")
+  ),
+  # Shlomo canyon, 100 m deployment
+  shlomo_100 = list(
+    curr_in  = file.path(mooring_dir, "shlomo_100m_in_current.csv"),
+    curr_out = file.path(mooring_dir, "shlomo_100m_out_current.csv"),
+    temp_in  = file.path(mooring_dir, "shlomo_100m_in_temperature.csv"),
+    temp_out = file.path(mooring_dir, "shlomo_100m_out_temperature.csv")
+  ),
+  # Shlomo continental shelf (SI station), 80 m
+  shlomo_80 = list(
+    curr = file.path(mooring_dir, "shlomo_80m_shelf_current.csv"),
+    temp = file.path(mooring_dir, "shlomo_80m_shelf_temperature.csv")
+  ),
+  # Princess and Eilat canyons, 100 m
+  princess = list(
+    curr_in  = file.path(mooring_dir, "princess_100m_in_current.csv"),
+    curr_out = file.path(mooring_dir, "princess_100m_out_current.csv"),
+    temp_in  = file.path(mooring_dir, "princess_100m_in_temperature.csv"),
+    temp_out = file.path(mooring_dir, "princess_100m_out_temperature.csv")
+  ),
+  eilat = list(
+    curr_in  = file.path(mooring_dir, "eilat_100m_in_current.csv"),
+    curr_out = file.path(mooring_dir, "eilat_100m_out_current.csv"),
+    temp_in  = file.path(mooring_dir, "eilat_100m_in_temperature.csv"),
+    temp_out = file.path(mooring_dir, "eilat_100m_out_temperature.csv")
+  )
+)
+
+# Output folder for figures, tables and the saved workspace
+out_dir <- file.path("..", "outputs")
+fig_dir <- out_dir
+dir.create(fig_dir, showWarnings = FALSE)
+
+# Stop early with a clear message if an input file is missing
+missing <- unlist(files)[!file.exists(unlist(files))]
+if (length(missing) > 0) stop("Missing input file(s):\n", paste(missing, collapse = "\n"))
+```
+
+```{r settings}
+# Common analysis window of the Shlomo 100 m and 200 m deployments
+sync_start_time <- as.POSIXct("2026-07-02 16:30:00", tz = TZ)
+sync_end_time   <- as.POSIXct("2026-08-12 13:30:00", tz = TZ)
+
+# Window of the Shlomo 80 m (SI) record
+sync_start_time_80 <- as.POSIXct("2026-06-02 13:30:00", tz = TZ)
+sync_end_time_80   <- as.POSIXct("2026-08-12 13:30:00", tz = TZ)
+
+# Deployment windows of the Princess and Eilat moorings
+canyon_times <- tibble(
+  canyon     = c("Princess", "Eilat"),
+  start_time = as.POSIXct(c("2026-01-25 14:20:00", "2026-02-23 16:00:00"), tz = TZ),
+  end_time   = as.POSIXct(c("2026-02-01 09:40:00", "2026-04-13 11:30:00"), tz = TZ)
+)
+
+# Hours removed at the start and at the end of every instrument record
+# (deployment and recovery of the moorings)
+trim_hours <- 3
+
+# Horizontal stretch of the stick-plot arrows (x axis is in seconds, u in cm/s)
+x_scale_factor <- 4000
+
+# ---------------------------------------------------------------------------
+# Figure style – used by every figure so that all figures look the same
+# ---------------------------------------------------------------------------
+# Font: Times New Roman, requested through R's generic "serif" family.
+# "serif" is understood by every R graphics device (screen, png, pdf,
+# cairo_pdf, ragg) and is drawn as Times New Roman on Windows (Times on
+# macOS). Asking for "Times New Roman" by name makes the standard pdf() and
+# png() devices fail silently, which produces empty files.
+font_family <- "serif"
+
+# Text sizes (pt) shared by all figures
+fig_sizes <- list(
+  axis_title   = 18,   # axis titles
+  axis_text    = 14,   # axis numbers
+  strip        = 16,   # panel title strips
+  legend_title = 16,
+  legend_text  = 14,
+  legend_key   = 1.3,  # size of the legend colour boxes (lines)
+  tag          = 18,   # panel letters
+  annotation   = 4.5   # text inside panels (mm, ggplot units)
+)
+
+theme_fig <- theme(
+  text         = element_text(family = font_family),
+  axis.title   = element_text(size = fig_sizes$axis_title),
+  axis.text    = element_text(size = fig_sizes$axis_text, colour = "black"),
+  strip.text   = element_text(size = fig_sizes$strip),
+  legend.title = element_text(size = fig_sizes$legend_title, face = "bold"),
+  legend.text  = element_text(size = fig_sizes$legend_text),
+  plot.tag     = element_text(size = fig_sizes$tag, face = "bold")
+)
+
+# Text drawn inside the panels (geom_text / geom_label) uses the same font
+update_geom_defaults("text",  list(family = font_family))
+update_geom_defaults("label", list(family = font_family))
+
+# Single y-axis title (left) and x-axis title (bottom) for a whole figure
+add_figure_titles <- function(panels, y = NULL, x = NULL, x_hjust = 0.5) {
+  wrap_elements(panel = panels) +
+    labs(tag = y, caption = x) +
+    theme(text              = element_text(family = font_family),
+          plot.tag          = element_text(angle = 90, size = fig_sizes$axis_title),
+          plot.tag.position = "left",
+          plot.caption      = element_text(size = fig_sizes$axis_title, hjust = x_hjust))
+}
+
+# Hide axis numbers but keep their space, so that panels stay evenly spaced
+hide_axis_text <- function(axis = c("x", "y")) {
+  axis <- match.arg(axis)
+  if (axis == "x") {
+    theme(axis.text.x = element_text(colour = "transparent"),
+          axis.ticks.x = element_line(colour = "transparent"))
+  } else {
+    theme(axis.text.y = element_text(colour = "transparent"),
+          axis.ticks.y = element_line(colour = "transparent"))
+  }
+}
+
+# Save a figure as PDF (vector, embedded font), 300-dpi PNG and 300-dpi TIFF.
+# Always pass the figure object explicitly: ggsave() without `plot =` saves
+# ggplot2's "last plot", which for a patchwork figure can be one of its
+# internal pieces (e.g. the empty legend panel).
+save_figure <- function(plot, name, width, height, dpi = 300) {
+  has_ragg   <- requireNamespace("ragg", quietly = TRUE)
+  pdf_device <- if (capabilities("cairo")) cairo_pdf else "pdf"
+  files <- file.path(fig_dir, paste0(name, c(".pdf", ".png", ".tiff")))
+  start <- Sys.time() - 1
+
+  ggsave(files[1], plot, width = width, height = height, device = pdf_device)
+  ggsave(files[2], plot, width = width, height = height, dpi = dpi, bg = "white",
+         device = if (has_ragg) ragg::agg_png else "png")
+  ggsave(files[3], plot, width = width, height = height, dpi = dpi, bg = "white",
+         device = if (has_ragg) ragg::agg_tiff else "tiff", compression = "lzw")
+
+  # Windows cannot overwrite a file that is open in another program (image
+  # viewer, PDF reader, Explorer preview pane). Check that every file was
+  # really rewritten and say so if not.
+  not_updated <- files[is.na(file.mtime(files)) | file.mtime(files) < start]
+  if (length(not_updated) > 0) {
+    warning("Not updated (probably open in another program - close it and run again):\n  ",
+            paste(not_updated, collapse = "\n  "), call. = FALSE)
+  } else {
+    message("Saved: ", paste(basename(files), collapse = ", "))
+  }
+
+  set_last_plot(plot)   # so that a later ggsave() without `plot =` also saves this figure
+  invisible(plot)
+}
+
+# Station names and colours (as in the published Figures 2 and 3).
+# One palette is used for every figure so that a single legend can be shared.
+station_levels <- c(
+  "Shlomo 80 m - Continental shelf", "Shlomo 100 m - In", "Shlomo 100 m - Out",
+  "Shlomo 200 m - In", "Shlomo 200 m - Out",
+  "Eilat 100 m - In", "Eilat 100 m - Out",
+  "Princess 100 m - In", "Princess 100 m - Out"
+)
+station_cols <- setNames(
+  c("#6ABD45", "#2A9D8F", "#A8DADC", "#E76F51", "#F4A261",
+    "#5C297A", "#E84B9B", "#8B5A2B", "#BFC043"),
+  station_levels
+)
+
+# Colour scale shared by all panels (all nine stations always listed, so
+# patchwork can merge the legends of the individual panels into one)
+scale_colour_station <- function(...) {
+  scale_colour_manual(values = station_cols, limits = station_levels,
+                      drop = FALSE, name = "Station:", ...)
+}
+
+# Stand-alone legend panel listing all nine stations.
+# The legend is drawn from one plot that contains every station, so it
+# appears once and looks the same in every ggplot2 version (since
+# ggplot2 3.5.0, a panel's legend only shows keys for stations present in
+# that panel, which prevents patchwork from merging the panel legends).
+#   key  = "path": line + point keys (Figures 2 and 3)
+#   key  = "fill": filled boxes (Figure 1)
+#   flow = TRUE  : also list the downwelling / upwelling colours (Figure 1)
+station_legend <- function(key = c("path", "fill"), flow = FALSE, ncol = 1,
+                           title_size = fig_sizes$legend_title,
+                           text_size  = fig_sizes$legend_text) {
+  key <- match.arg(key)
+  d <- tibble(station_id = factor(station_levels, levels = station_levels), x = 0, y = 0)
+  p <- ggplot(d, aes(x, y))
+  if (key == "path") {
+    p <- p +
+      geom_path(aes(colour = station_id), alpha = 0) +
+      geom_point(aes(colour = station_id), alpha = 0, size = 2.5) +
+      scale_colour_station(guide = guide_legend(ncol = ncol, override.aes = list(alpha = 1)))
+  } else {
+    p <- p +
+      geom_tile(aes(fill = station_id), alpha = 0, colour = NA) +
+      scale_fill_manual(values = station_cols, limits = station_levels, name = "Station:",
+                        guide = guide_legend(order = 2, ncol = ncol,
+                                             override.aes = list(alpha = 1, colour = "black")))
+  }
+  if (flow) {
+    fk <- tibble(Flow = factor(names(flow_cols), levels = names(flow_cols)), x = 0, y = 0)
+    # drawn with the same box glyph as the station keys, so all boxes match
+    p <- p +
+      geom_point(data = fk, aes(x, y, colour = Flow), alpha = 0, key_glyph = "polygon") +
+      scale_colour_manual(values = flow_cols, labels = flow_labels, name = "Flow:",
+                          guide = guide_legend(order = 1, ncol = 1,
+                                               override.aes = list(alpha = 1, fill = flow_cols,
+                                                                   colour = "black")))
+  }
+  p <- p + theme_void() +
+    theme(legend.position = "left",
+          legend.key.size = unit(fig_sizes$legend_key, "lines"),
+          text         = element_text(family = font_family),
+          legend.title = element_text(face = "bold", size = title_size),
+          legend.text  = element_text(size = text_size))
+  # wrapped so that the legend does not take part in the panel alignment
+  wrap_elements(full = p)
+}
+```
+
+# 2. Helper functions
+
+```{r helpers}
+# ---------------------------------------------------------------------------
+# Reading raw instrument files
+# ---------------------------------------------------------------------------
+
+# Current meter export (columns: ISO 8601 Time, Speed (cm/s), Heading (degrees),
+# Velocity-N (cm/s), Velocity-E (cm/s)). Returns a data frame with `time` (POSIXct).
+read_current_csv <- function(file) {
+  read.csv(file) %>%
+    rename(
+      Time       = ISO.8601.Time,
+      Speed      = Speed..cm.s.,
+      Heading    = Heading..degrees.,
+      Velocity_N = Velocity.N..cm.s.,
+      Velocity_E = Velocity.E..cm.s.
+    ) %>%
+    mutate(time = ymd_hms(Time, tz = TZ))
+}
+
+# Merged temperature file of one mooring line: a `time` column plus one
+# column per logger named "temp - depth <m>".
+read_temp_csv <- function(file, time_format = c("ymd_hms", "dmy_hm")) {
+  time_format <- match.arg(time_format)
+  parse_time  <- switch(time_format, ymd_hms = ymd_hms, dmy_hm = dmy_hm)
+  read.csv(file) %>% mutate(time = parse_time(time, tz = TZ))
+}
+
+# Remove the first and the last `n_hours` of an instrument record, i.e. the
+# periods when the mooring was being deployed or recovered. Applied to every
+# raw file (current and temperature) before any other step. Works per group
+# if the data frame is grouped.
+trim_deployment_edges <- function(df, n_hours = trim_hours) {
+  df %>% filter(
+    time >= min(time, na.rm = TRUE) + hours(n_hours),
+    time <= max(time, na.rm = TRUE) - hours(n_hours)
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Current vectors and principal axes
+# ---------------------------------------------------------------------------
+
+# Speed + compass heading  ->  east (u) and north (v) velocity components (cm/s)
+add_uv <- function(df) {
+  df %>%
+    filter(!is.na(time), !is.na(speed), !is.na(heading)) %>%
+    mutate(
+      theta = heading * pi / 180,
+      u = speed * sin(theta),   # East (+) / West (-)
+      v = speed * cos(theta)    # North (+) / South (-)
+    )
+}
+
+# Principal axis of the current (first eigenvector of the u–v covariance
+# matrix), returned as a compass bearing (degrees clockwise from North).
+# `...` are the grouping columns.
+calc_principal_axes <- function(df, ...) {
+  df %>%
+    filter(!is.na(u), !is.na(v)) %>%
+    group_by(...) %>%
+    summarise(
+      cov_matrix = list(cov(cbind(u, v))),
+      eig        = list(eigen(cov_matrix[[1]])),
+      pc1_u      = eig[[1]]$vectors[1, 1],
+      pc1_v      = eig[[1]]$vectors[2, 1],
+      angle_rad  = atan2(pc1_v, pc1_u),
+      compass_heading  = (90 - (angle_rad * 180 / pi)) %% 360,
+      principal_axis_1 = round(compass_heading, 1),
+      principal_axis_2 = round((compass_heading + 180) %% 360, 1),
+      .groups = "drop"
+    ) %>%
+    select(..., principal_axis_1, principal_axis_2)
+}
+
+# Progressive vector diagram: cumulative displacement (km) of a water parcel
+# advected by the measured velocity. `...` are the columns defining a track.
+compute_pvd <- function(df, ...) {
+  df %>%
+    arrange(..., time) %>%
+    group_by(...) %>%
+    mutate(
+      dt_sec   = replace_na(as.numeric(difftime(time, lag(time), units = "secs")), 0),
+      cum_x_km = cumsum(u * dt_sec) / 100000,   # cm -> km
+      cum_y_km = cumsum(v * dt_sec) / 100000
+    ) %>%
+    ungroup()
+}
+
+# ---------------------------------------------------------------------------
+# Complete processing of one Shlomo 100 m / 200 m deployment
+# (was: "Temp + Current ... Shlomo Canyon.Rmd", one script per deployment)
+# ---------------------------------------------------------------------------
+process_shlomo_deployment <- function(f) {
+
+  # Currents: in and out stations, deployment/recovery hours removed
+  curr <- bind_rows(
+    read_current_csv(f$curr_in)  %>% trim_deployment_edges() %>% mutate(station = "in"),
+    read_current_csv(f$curr_out) %>% trim_deployment_edges() %>% mutate(station = "out")
+  ) %>%
+    arrange(station, time)
+
+  # Wide table with the in – out speed difference
+  curr_wide <- curr %>%
+    group_by(station, time) %>%
+    summarise(Speed = mean(Speed, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = station, values_from = Speed, names_prefix = "Speed_") %>%
+    mutate(delta_speed = Speed_in - Speed_out)
+
+  # Velocity components
+  df_vec <- curr %>%
+    transmute(time, station, speed = Speed, heading = Heading) %>%
+    add_uv()
+
+  # Principal axis of each station
+  pca_results <- calc_principal_axes(df_vec, station)
+
+  # Temperature: long format (one row per logger and time step) + smoothing
+  temp_to_long <- function(file, st) {
+    read_temp_csv(file, "ymd_hms") %>%
+      trim_deployment_edges() %>%
+      pivot_longer(cols = starts_with("temp"), names_to = "sensor", values_to = "temp_c") %>%
+      mutate(
+        station = st,
+        depth_m = as.numeric(str_extract(sensor, "(?i)(?<=depth[_\\.])\\d+"))
+      ) %>%
+      select(time, station, depth_m, temp_c, sensor)
+  }
+
+  k <- 30  # centred moving-average window (30 samples = 5 h at 10-min sampling)
+  temp_smooth2 <- bind_rows(
+    temp_to_long(f$temp_in,  "in"),
+    temp_to_long(f$temp_out, "out")
+  ) %>%
+    filter(!is.na(time), !is.na(depth_m), !is.na(temp_c)) %>%
+    arrange(station, depth_m, time) %>%
+    group_by(station, depth_m) %>%
+    mutate(
+      temp_c_smooth = slide_dbl(temp_c, mean, .before = 2, .after = 0, .complete = TRUE),
+      temp_ma = slide_dbl(temp_c, mean,
+                          .before = floor((k - 1) / 2), .after = ceiling((k - 1) / 2),
+                          .complete = FALSE, na.rm = TRUE)
+    ) %>%
+    ungroup()
+
+  list(curr_wide = curr_wide, df_vec = df_vec,
+       pca_results = pca_results, temp_smooth2 = temp_smooth2)
+}
+
+# ---------------------------------------------------------------------------
+# Night shading (00:00–06:00 and 18:00–24:00) and midnight lines
+# ---------------------------------------------------------------------------
+make_night_bands <- function(start_t, end_t) {
+  days <- tibble(day = seq.Date(as.Date(start_t, tz = TZ), as.Date(end_t, tz = TZ), by = "day"))
+  bind_rows(
+    days %>% mutate(xmin = as.POSIXct(paste(day, "00:00:00"), tz = TZ),
+                    xmax = as.POSIXct(paste(day, "06:00:00"), tz = TZ)),
+    days %>% mutate(xmin = as.POSIXct(paste(day, "18:00:00"), tz = TZ),
+                    xmax = as.POSIXct(paste(day, "23:59:59"), tz = TZ))
+  ) %>%
+    mutate(xmin = pmax(xmin, start_t), xmax = pmin(xmax, end_t),
+           ymin = -Inf, ymax = Inf) %>%
+    filter(xmax > xmin)
+}
+
+# ---------------------------------------------------------------------------
+# Cross-correlation between along-flow velocity and temperature, returned
+# in long format (one row per lag). Input must be on a regular 30-min grid.
+# ---------------------------------------------------------------------------
+tidy_ccf <- function(v, temp, lag_max = 24) {
+  cc <- ccf(v, temp, lag.max = lag_max, plot = FALSE, na.action = na.pass)
+  tibble(lag = cc$lag[, 1, 1], acf = cc$acf[, 1, 1])
+}
+
+# Panel letters in the top-left corner of each panel
+tag_inside <- function(x = 0.01, y = 0.99, size = fig_sizes$tag) {
+  theme(plot.tag = element_text(size = size, face = "bold"), plot.tag.position = c(x, y))
+}
+```
+
+# 3. Load and process the raw data
+
+Every raw file (current meters and temperature loggers) is first trimmed by
+`trim_hours` (3 h) at its start and at its end, so that the periods of
+deployment and recovery of the moorings are excluded. A table of the
+periods kept for each station is printed at the end of this section.
+
+## 3.1 Shlomo canyon, 100 m and 200 m moorings
+
+```{r shlomo-100-200}
+shlomo_200 <- process_shlomo_deployment(files$shlomo_200)
+shlomo_100 <- process_shlomo_deployment(files$shlomo_100)
+
+add_labels <- function(df, depth) {
+  df %>% mutate(deployment_depth = depth,
+                Station    = ifelse(station == "in", "In", "Out"),
+                station_id = paste0("Shlomo ", depth, " - ", Station))
+}
+
+df_vec_200 <- add_labels(shlomo_200$df_vec, "200 m")
+df_vec_100 <- add_labels(shlomo_100$df_vec, "100 m")
+
+pca_200 <- add_labels(shlomo_200$pca_results, "200 m")
+pca_100 <- add_labels(shlomo_100$pca_results, "100 m")
+
+temp_smooth2_200 <- add_labels(shlomo_200$temp_smooth2, "200 m")
+temp_smooth2_100 <- add_labels(shlomo_100$temp_smooth2, "100 m")
+
+bind_rows(pca_200, pca_100) %>% select(station_id, principal_axis_1, principal_axis_2)
+```
+
+## 3.2 Shlomo continental shelf (SI station), 80 m
+
+```{r shlomo-80}
+df_SI_80 <- read_current_csv(files$shlomo_80$curr) %>%
+  trim_deployment_edges() %>%
+  transmute(time, Station = "Continental shelf", speed = Speed, heading = Heading) %>%
+  add_uv() %>%
+  mutate(deployment_depth = "80m",
+         station_id = "Shlomo 80 m - Continental shelf")
+
+pca_80 <- calc_principal_axes(df_SI_80, deployment_depth, Station, station_id)
+
+temp_smooth_80 <- read.csv(files$shlomo_80$temp) %>%
+  rename(time = ISO.8601.Time, temp_c = Temperature..C.) %>%
+  mutate(time = ymd_hms(time, tz = TZ),
+         Station = "Continental shelf",
+         depth_m = 80,
+         deployment_depth = "80m",
+         station_id = "Shlomo 80 m - Continental shelf") %>%
+  filter(!is.na(time), !is.na(temp_c)) %>%
+  trim_deployment_edges() %>%
+  filter(time >= sync_start_time_80 & time <= sync_end_time_80)
+
+pca_80 %>% select(station_id, principal_axis_1, principal_axis_2)
+```
+
+## 3.3 Princess and Eilat canyons, 100 m moorings
+
+```{r eilat-princess}
+load_canyon_files <- function(canyon_name, f) {
+  # Each raw file is trimmed at its own start and end (deployment/recovery)
+  # before the analysis window of the canyon is applied
+  temp <- bind_rows(
+    read_temp_csv(f$temp_in,  "dmy_hm") %>% trim_deployment_edges() %>% mutate(location = "In"),
+    read_temp_csv(f$temp_out, "dmy_hm") %>% trim_deployment_edges() %>% mutate(location = "Out")
+  ) %>% mutate(type = "Temp")
+
+  curr <- bind_rows(
+    read_current_csv(f$curr_in)  %>% trim_deployment_edges() %>% mutate(location = "In"),
+    read_current_csv(f$curr_out) %>% trim_deployment_edges() %>% mutate(location = "Out")
+  ) %>% mutate(type = "Current")
+
+  bind_rows(temp, curr) %>% mutate(canyon = canyon_name)
+}
+
+all_clean_data <- bind_rows(
+  load_canyon_files("Princess", files$princess),
+  load_canyon_files("Eilat",    files$eilat)
+) %>%
+  filter(!is.na(time)) %>%
+  inner_join(canyon_times, by = "canyon") %>%
+  filter(time >= start_time & time <= end_time) %>%
+  select(-start_time, -end_time) %>%
+  mutate(station_id = paste0(canyon, " 100 m - ", location))
+
+# Current vectors of the four Princess/Eilat stations
+curr_ep <- all_clean_data %>%
+  filter(type == "Current") %>%
+  transmute(time, canyon, station = location, station_id,
+            speed = Speed, heading = Heading) %>%
+  add_uv()
+```
+
+## 3.4 Periods used for each station (after trimming)
+
+```{r periods-used}
+period_table <- function(df, what) {
+  df %>% group_by(station_id) %>%
+    summarise(first = min(time), last = max(time), n = n(), .groups = "drop") %>%
+    mutate(variable = what)
+}
+bind_rows(
+  period_table(bind_rows(df_vec_200, df_vec_100, df_SI_80, curr_ep), "current"),
+  period_table(bind_rows(temp_smooth2_200, temp_smooth2_100) %>% distinct(station_id, time), "temperature"),
+  period_table(distinct(temp_smooth_80, station_id, time), "temperature"),
+  period_table(all_clean_data %>% filter(type == "Temp") %>% distinct(station_id, time), "temperature")
+) %>%
+  mutate(station_id = factor(station_id, levels = station_levels)) %>%
+  arrange(station_id, variable) %>%
+  mutate(first = format(first, "%d/%m/%Y %H:%M"), last = format(last, "%d/%m/%Y %H:%M")) %>%
+  knitr::kable()
+```
+
+# 4. Figure 2 – current speed and direction at each station
+
+Each station panel shows the density distribution of current speed, with an
+inset rose diagram of current direction (15° sectors). The rose bars are
+split into downwelling (down-canyon) and upwelling (up-canyon) flow, defined
+by projecting the velocity on the local down-canyon bearing; the percentage
+of observations in each direction is written in the lower-left corner.
+Panel A is the reference scale of all roses (rings at 5, 10 and 15 % of the
+observations of the station). All panels share the same y axis.
+
+```{r fig1-data}
+# Down-canyon (deepening) bearing of each station, degrees from North
+down_bearings <- c(
+  "Shlomo 80 m - Continental shelf" = 110,
+  "Shlomo 100 m - In"  = 135, "Shlomo 100 m - Out" = 110,
+  "Shlomo 200 m - In"  = 135, "Shlomo 200 m - Out" = 110,
+  "Eilat 100 m - In"   = 180, "Eilat 100 m - Out"  = 180,
+  "Princess 100 m - In" = 135, "Princess 100 m - Out" = 130
+)
+
+# Shlomo: 100 m and 200 m restricted to their common window, 80 m to its own
+vec_rose <- bind_rows(
+  df_vec_200 %>% filter(time >= sync_start_time & time <= sync_end_time),
+  df_vec_100 %>% filter(time >= sync_start_time & time <= sync_end_time),
+  df_SI_80   %>% filter(time >= sync_start_time_80 & time <= sync_end_time_80),
+  curr_ep
+) %>%
+  mutate(
+    direction     = (atan2(u, v) * 180 / pi) %% 360,
+    down_rad      = down_bearings[station_id] * pi / 180,
+    topo_velocity = u * sin(down_rad) + v * cos(down_rad),   # + = down-slope
+    Flow = factor(case_when(topo_velocity > 0 ~ "Down",
+                            topo_velocity < 0 ~ "Up"),
+                  levels = c("Down", "Up"))
+  )
+
+flow_cols   <- c("Down" = "#e67e22", "Up" = "#4b6cb7")
+
+# Percentage of down- and up-slope flow at each station
+flow_summary <- vec_rose %>%
+  filter(!is.na(Flow)) %>%
+  group_by(station_id) %>%
+  summarise(n = n(),
+            percent_down = round(100 * mean(Flow == "Down"), 1),
+            percent_up   = round(100 * mean(Flow == "Up"), 1),
+            mean_topo_velocity = mean(topo_velocity),
+            .groups = "drop")
+flow_summary
+
+# Roses show the percentage of the observations of each station in every
+# 15° sector, so that stations with records of different length share one
+# radial scale (panel A)
+max_sector <- vec_rose %>%
+  filter(!is.na(Flow)) %>%
+  mutate(sector = cut(direction, breaks = seq(0, 360, by = 15), include.lowest = TRUE)) %>%
+  count(station_id, sector) %>%
+  group_by(station_id) %>% mutate(percent = 100 * n / sum(n)) %>%
+  ungroup() %>% summarise(max_percent = max(percent))
+max_sector
+
+rose_breaks <- c(5, 10, 15)
+rose_max    <- max(max_sector$max_percent, max(rose_breaks)) * 1.1
+
+# Common speed axis for all density panels
+speed_max <- quantile(vec_rose$speed, 0.999, na.rm = TRUE)
+```
+
+```{r fig1-functions}
+flow_labels <- c("Down" = "Downwelling", "Up" = "Upwelling")
+
+# Canyon of each station (panels of the same canyon share the y axis)
+canyon_of <- function(id) word(id, 1)
+
+# Density y-range shared by all stations
+dens_max <- vec_rose %>%
+  group_by(station_id) %>%
+  summarise(max_d = max(density(speed, na.rm = TRUE)$y), .groups = "drop") %>%
+  pull(max_d) %>% max() * 1.05
+
+# y labels: at most two decimals, trailing zeros dropped (0.10 -> 0.1, 0.00 -> 0)
+label_2dec  <- function(x) sub("\\.?0+$", "", sprintf("%.2f", x))
+# ...and only breaks that can be written exactly with two decimals
+breaks_2dec <- function(lim) {
+  b <- pretty(lim, n = 5)
+  b[abs(b * 100 - round(b * 100)) < 1e-9]
+}
+
+theme_rose <- theme_void() +
+  theme(text             = element_text(family = font_family),
+        axis.text.x      = element_text(color = "black", size = fig_sizes$axis_text - 1,
+                                        face = "bold"),
+        panel.grid.major = element_line(color = "grey80", linewidth = 0.3),
+        legend.position  = "none",
+        plot.background  = element_rect(fill = "transparent", colour = NA))
+
+# Rose diagram of one station, bars stacked by downwelling / upwelling flow
+rose_inset <- function(id, y_max, y_breaks = waiver()) {
+  ggplot(filter(vec_rose, station_id == id, !is.na(Flow)),
+         aes(x = direction, fill = Flow)) +
+    geom_histogram(aes(y = after_stat(100 * count / sum(count))),
+                   breaks = seq(0, 360, by = 15), position = "stack",
+                   color = "black", linewidth = 0.2) +
+    coord_polar(start = 0) +
+    scale_x_continuous(limits = c(0, 360), breaks = seq(0, 315, by = 45),
+                       labels = c("N", "", "E", "", "S", "", "W", "")) +
+    scale_y_continuous(limits = c(0, y_max), breaks = y_breaks) +
+    scale_fill_manual(values = flow_cols) +
+    theme_rose
+}
+
+theme_station <- theme_bw() + theme_fig +
+  theme(panel.grid.minor = element_blank())
+
+# Speed density of one station with its rose diagram as an inset.
+# The percentage of downwelling / upwelling observations is written
+# in the lower-left corner.
+station_panel <- function(id, y_max, y_breaks = waiver(), tag = NULL,
+                          show_x = TRUE, show_y = TRUE) {
+  ymax <- dens_max
+  fs   <- filter(flow_summary, station_id == id)
+
+  dens <- ggplot(filter(vec_rose, station_id == id), aes(x = speed)) +
+    geom_density(aes(fill = station_id), colour = "black", alpha = 0.5) +
+    annotate("label", x = speed_max * 0.02, y = ymax * 0.02, hjust = 0, vjust = 0,
+             size = fig_sizes$annotation, label.size = 0, fill = alpha("white", 0.75),
+             lineheight = 1,
+             label = sprintf("Downwelling: %.1f%%\nUpwelling: %.1f%%",
+                             fs$percent_down, fs$percent_up)) +
+    scale_fill_manual(values = station_cols, guide = "none") +
+    scale_x_continuous(expand = expansion(mult = c(0, 0.02))) +
+    scale_y_continuous(breaks = breaks_2dec, labels = label_2dec, expand = expansion(mult = c(0, 0))) +
+    coord_cartesian(xlim = c(0, speed_max), ylim = c(0, ymax)) +
+    labs(x = NULL, y = NULL, tag = tag) +
+    theme_station
+  # Hidden axis numbers are made transparent (not removed) so that every panel
+  # keeps the same margins and the panels stay evenly spaced
+  if (!show_y) dens <- dens + hide_axis_text("y")
+  if (!show_x) dens <- dens + hide_axis_text("x")
+
+  dens + inset_element(rose_inset(id, y_max, y_breaks),
+                       left = 0.26, bottom = 0.08, right = 0.99, top = 1.01,
+                       ignore_tag = TRUE)
+}
+
+# Reference panel : ring values and cardinal directions
+rose_scale_panel <- function(y_breaks, y_max) {
+  ref_labels <- tibble(direction = 45, y_val = y_breaks,
+                       label = paste0(y_breaks, "%"))
+  cardinal   <- tibble(direction = c(0, 90, 180, 270), y_val = y_max,
+                       label = c("N", "E", "S", "W"))
+  ggplot() +
+    geom_label(data = ref_labels, aes(x = direction, y = y_val, label = label),
+               size = 4.3, fontface = "bold", fill = "white", color = "grey15",
+               label.padding = unit(0.2, "lines")) +
+    geom_label(data = cardinal, aes(x = direction, y = y_val, label = label),
+               size = 4, fontface = "bold", fill = "#264653", color = "white",
+               label.padding = unit(0.25, "lines")) +
+    coord_polar(start = 0) +
+    scale_x_continuous(limits = c(0, 360), breaks = seq(0, 360, by = 45)) +
+    scale_y_continuous(limits = c(0, y_max), breaks = y_breaks) +
+    labs(x = NULL, y = NULL) +
+    theme_minimal() +
+    theme(text = element_text(family = font_family),
+          axis.text = element_blank(),
+          panel.grid.major = element_line(color = "grey80"))
+}
+```
+
+```{r fig1-assemble, fig.width=18, fig.height=11}
+# Grid (4 panel columns + legend column):
+#   row 1: scale | Shlomo 80m | Shlomo 100m In | Shlomo 100m Out
+#   row 2: Shlomo 200m In | Shlomo 200m Out | Eilat In | Eilat Out
+#   row 3: Princess In | Princess Out
+# All panels share one y range. y-axis numbers are shown only on the first
+# panel of each row (B, E, I); x-axis numbers only on the bottom panel of each
+# column (G, H, I, J).
+panel_order <- c("Scale", station_levels)
+show_y <- setNames(station_levels %in% c("Shlomo 80m - Continental shelf",
+                                         "Shlomo 200m - In", "Princess 100m - In"),
+                   station_levels)
+show_x <- setNames(station_levels %in% c("Eilat 100m - In", "Eilat 100m - Out",
+                                         "Princess 100m - In", "Princess 100m - Out"),
+                   station_levels)
+tags <- setNames(LETTERS[seq_along(panel_order)], panel_order)
+
+rose_scale <- rose_scale_panel(rose_breaks, rose_max) + labs(tag = tags[["Scale"]])
+
+station_panels <- map(station_levels, function(id) {
+  station_panel(id,
+                y_max    = rose_max,
+                y_breaks = rose_breaks,
+                tag      = tags[[id]],
+                show_x   = show_x[[id]],
+                show_y   = show_y[[id]])
+}) %>% set_names(station_levels)
+
+design_fig2 <- "
+ABCDK
+EFGHK
+IJ##K
+"
+
+figure2_panels <- wrap_plots(c(list(rose_scale), station_panels)) +
+  station_legend("fill", flow = TRUE) +
+  plot_layout(design = design_fig2, widths = c(1, 1, 1, 1, 1.45)) &
+  theme(plot.tag = element_text(face = "bold", size = fig_sizes$tag))
+
+# One y-axis title (left) and one x-axis title (bottom) for the whole figure
+figure2 <- add_figure_titles(figure2_panels, y = "Density",
+                             x = "Current Speed (cm/s)", x_hjust = 0.37)
+
+figure2
+
+save_figure(figure2, "Figure 2", width = 18, height = 11)
+```
+
+# 5. Figure 3 – progressive vector diagrams
+
+The Shlomo 100 m and 200 m stations are integrated over their common window
+(2 Jul – 12 Aug), the other stations over their full record. Each track shows
+the first measurement of each day (yellow), the start (black triangle) and
+the end point (filled circle).
+
+```{r fig2-pvd}
+pvd_all <- bind_rows(
+  bind_rows(df_vec_200, df_vec_100) %>% filter(time >= sync_start_time & time <= sync_end_time),
+  df_SI_80   %>% filter(time >= sync_start_time_80 & time <= sync_end_time_80),
+  curr_ep
+) %>%
+  compute_pvd(station_id)
+
+theme_pvd <- theme_bw() + theme_fig +
+  theme(panel.grid.major = element_line(color = "grey85", linetype = "dashed"),
+        panel.grid.minor = element_blank())
+
+pvd_panel <- function(ids) {
+  pvd <- filter(pvd_all, station_id %in% ids)
+  daily_points <- pvd %>%
+    mutate(date_only = as.Date(time, tz = TZ)) %>%
+    group_by(station_id, date_only) %>% slice(1) %>% ungroup()
+  end_points <- pvd %>%
+    group_by(station_id) %>% filter(time == max(time)) %>% ungroup()
+
+  ggplot(pvd, aes(x = cum_x_km, y = cum_y_km, color = station_id)) +
+    geom_path(linewidth = 0.8) +
+    geom_point(data = daily_points, size = 1.5, shape = 21, fill = "yellow", stroke = 0.8) +
+    geom_point(aes(x = 0, y = 0), color = "black", size = 4, shape = 17, inherit.aes = FALSE) +
+    geom_point(data = end_points, size = 3, shape = 16) +
+    scale_colour_station(guide = "none") +
+    coord_fixed() +
+    labs(x = NULL, y = NULL) +
+    theme_pvd
+}
+
+pvd_Shlomo   <- pvd_panel(station_levels[1:5])
+# narrow panels: few x ticks so that the numbers do not overlap
+# (Eilat: about 3 "pretty" ticks, since its record is long; Princess: every 2 km)
+pvd_Eilat    <- pvd_panel(station_levels[6:7]) + scale_x_continuous(breaks = scales::breaks_pretty(n = 3))
+pvd_Princess <- pvd_panel(station_levels[8:9]) + scale_x_continuous(breaks = scales::breaks_width(2))
+```
+
+```{r fig2-assemble, fig.width=15, fig.height=6}
+# All PVD panels have the same height while keeping a 1:1 km scale:
+# each panel's width is set proportional to its east-west / north-south range.
+pvd_aspect <- function(ids) {
+  d <- filter(pvd_all, station_id %in% ids)
+  diff(range(d$cum_x_km)) / diff(range(d$cum_y_km))
+}
+pvd_widths <- c(pvd_aspect(station_levels[1:5]),
+                pvd_aspect(station_levels[6:7]),
+                pvd_aspect(station_levels[8:9]))
+
+figure3_panels <- pvd_Shlomo + pvd_Eilat + pvd_Princess + station_legend("fill") +
+  plot_layout(widths = c(pvd_widths, 1.2)) +
+  plot_annotation(tag_levels = list(c("A", "B", "C", ""))) &   # legend panel untagged
+  tag_inside(0.01, 0.99)
+
+figure3 <- add_figure_titles(figure3_panels,
+                             y = "North-South Displacement (km)",
+                             x = "East-West Displacement (km)", x_hjust = 0.3)
+
+figure3
+
+save_figure(figure3, "Figure 3", width = 15, height = 6)
+```
+
+## 5.1 Supplementary figure 1 – current stick plots
+
+Each arrow starts at (time, 0) and points to (time + u × `x_scale_factor`, v).
+The red line marks the mean current speed of the station (drawn at
+−mean speed); grey bands mark night (18:00–06:00). Panels of the same canyon
+share the y axis.
+
+```{r figS-stick}
+stick_all <- bind_rows(
+  bind_rows(df_vec_200, df_vec_100) %>% filter(time >= sync_start_time & time <= sync_end_time),
+  df_SI_80,
+  curr_ep
+)
+
+# Shlomo panels share one y range (as in the original facetted plot)
+ylim_stick_shlomo <- stick_all %>%
+  filter(str_starts(station_id, "Shlomo")) %>%
+  summarise(lo = min(c(v, -speed)), hi = max(v)) %>% unlist()
+# Eilat and Princess panels share one y range
+ylim_stick_ep <- stick_all %>%
+  filter(str_starts(station_id, "Eilat") | str_starts(station_id, "Princess")) %>%
+  summarise(lo = min(c(v, -speed)), hi = max(v)) %>% unlist()
+
+theme_stick <- theme_bw() + theme_fig +
+  theme(axis.text.x      = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        panel.grid.minor = element_blank())
+
+stick_panel <- function(id, ylim, date_breaks, show_x = TRUE, show_y = TRUE) {
+  df <- filter(stick_all, station_id == id) %>% mutate(panel = id)
+  night <- make_night_bands(min(df$time), max(df$time))
+  avg_speed <- mean(df$speed, na.rm = TRUE)
+
+  p <- ggplot(df) +
+    geom_rect(data = night, aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf),
+              inherit.aes = FALSE, fill = "grey70", alpha = 0.25) +
+    geom_hline(yintercept = 0, color = "grey40", linetype = "dashed", linewidth = 0.8) +
+    geom_segment(aes(x = time, y = 0, xend = time + u * x_scale_factor, yend = v),
+                 color = "mediumblue", linewidth = 0.6) +
+    geom_hline(yintercept = -avg_speed, color = "red", linewidth = 0.8, alpha = 0.8) +
+    facet_wrap(~ panel) +                      # grey title strip
+    scale_x_datetime(date_breaks = date_breaks, date_labels = "%d/%m") +
+    coord_cartesian(ylim = ylim) +
+    labs(x = NULL, y = NULL) +
+    theme_stick
+  if (!show_x) p <- p + hide_axis_text("x")
+  if (!show_y) p <- p + hide_axis_text("y")
+  p
+}
+
+stick_80        <- stick_panel("Shlomo 80 m - Continental shelf", ylim_stick_shlomo, "4 days")
+stick_100_in    <- stick_panel("Shlomo 100 m - In",  ylim_stick_shlomo, "4 days", show_x = FALSE)
+stick_100_out   <- stick_panel("Shlomo 100 m - Out", ylim_stick_shlomo, "4 days", show_x = FALSE, show_y = FALSE)
+stick_200_in    <- stick_panel("Shlomo 200 m - In",  ylim_stick_shlomo, "4 days")
+stick_200_out   <- stick_panel("Shlomo 200 m - Out", ylim_stick_shlomo, "4 days", show_y = FALSE)
+stick_eilat_in  <- stick_panel("Eilat 100 m - In",   ylim_stick_ep, "1 week")
+stick_eilat_out <- stick_panel("Eilat 100 m - Out",  ylim_stick_ep, "1 week", show_y = FALSE)
+stick_pr_in     <- stick_panel("Princess 100 m - In",  ylim_stick_ep, "1 day")
+stick_pr_out    <- stick_panel("Princess 100 m - Out", ylim_stick_ep, "1 day", show_y = FALSE)
+```
+
+```{r figS-stick-assemble, fig.width=17, fig.height=12}
+# Layout (letters = panels in the order they are added):
+#   row 1: A Shlomo 80m
+#   row 2: B Shlomo 100m In | C Shlomo 100m Out | F Eilat In    | G Eilat Out
+#   row 3: D Shlomo 200m In | E Shlomo 200m Out | H Princess In | I Princess Out
+design_figS1_stick <- "
+A###
+BCFG
+DEHI
+"
+
+figureS1_stick_panels <- stick_80 +
+  stick_100_in + stick_100_out + stick_200_in + stick_200_out +
+  stick_eilat_in + stick_eilat_out + stick_pr_in + stick_pr_out +
+  plot_layout(design = design_figS1_stick) +
+  plot_annotation(tag_levels = "A") &
+  tag_inside(0.01, 0.99)
+
+figureS1_stick <- add_figure_titles(figureS1_stick_panels, y = "North–South velocity (cm s⁻¹)")
+
+figureS1_stick
+
+save_figure(figureS1_stick, "Figure S1", width = 17, height = 12)
+```
+
+# 6. Figure 4 – cross-correlation between velocity and temperature
+
+Velocity and temperature are averaged on a 30-min grid, so one lag step
+= 0.5 h and `lag.max = 24` covers ±12 h. Negative lags: velocity leads.
+
+The same method is used for all canyons: velocity is projected on the
+principal axis of each station, and both series are smoothed with a 5-point
+(2.5 h) centred moving average before the CCF. The principal axis has no
+natural sign, so every axis is oriented toward the northern half of the
+compass (positive along-axis velocity = flow with a northward component).
+
+## 6.1 Shlomo (panels A–D)
+
+```{r fig3-shlomo}
+# Principal axis oriented toward the northern half of the compass
+orient_north <- function(bearing) ifelse(bearing > 90 & bearing < 270, (bearing + 180) %% 360, bearing)
+
+pca_combined <- bind_rows(pca_200, pca_100, pca_80) %>%
+  mutate(principal_axis_1 = orient_north(principal_axis_1))
+
+vec_ccf_shlomo <- bind_rows(
+  df_vec_200 %>% filter(time >= sync_start_time & time <= sync_end_time),
+  df_vec_100 %>% filter(time >= sync_start_time & time <= sync_end_time),
+  df_SI_80   %>% filter(time >= sync_start_time_80 & time <= sync_end_time_80)
+) %>%
+  left_join(select(pca_combined, station_id, principal_axis_1), by = "station_id") %>%
+  mutate(
+    time      = floor_date(time, "30 minutes"),
+    theta_rad = (90 - principal_axis_1) * pi / 180,
+    v_pca     = u * cos(theta_rad) + v * sin(theta_rad)   # along-axis velocity
+  ) %>%
+  group_by(station_id, time) %>%
+  summarise(v_pca = mean(v_pca, na.rm = TRUE), .groups = "drop")
+
+temp_ccf_shlomo <- bind_rows(
+  temp_smooth2_200 %>% filter(time >= sync_start_time & time <= sync_end_time),
+  temp_smooth2_100 %>% filter(time >= sync_start_time & time <= sync_end_time),
+  temp_smooth_80
+) %>%
+  mutate(time = floor_date(time, "30 minutes")) %>%
+  group_by(station_id, depth_m, time) %>%
+  summarise(temp_c = mean(temp_c, na.rm = TRUE), .groups = "drop")
+
+ccf_shlomo <- temp_ccf_shlomo %>%
+  inner_join(vec_ccf_shlomo, by = c("station_id", "time")) %>%
+  mutate(height = case_when(
+    depth_m %in% c(200, 100)    ~ "Seabed",
+    depth_m %in% c(199, 99, 80) ~ "1m Above Seabed",
+    depth_m %in% c(197, 97)     ~ "3m Above Seabed",
+    depth_m %in% c(195, 95)     ~ "5m Above Seabed"
+  )) %>%
+  filter(!is.na(height)) %>%
+  group_by(station_id, height, depth_m) %>%
+  arrange(time, .by_group = TRUE) %>%
+  mutate(temp_smooth = rollmean(temp_c, k = 5, fill = NA, align = "center"),
+         v_smooth    = rollmean(v_pca,  k = 5, fill = NA, align = "center")) %>%
+  filter(!is.na(temp_smooth), !is.na(v_smooth)) %>%
+  reframe(tidy_ccf(v_smooth, temp_smooth, lag_max = 24)) %>%
+  mutate(canyon = "Shlomo")
+```
+
+## 6.2 Eilat and Princess (panels E–L)
+
+Same method as for Shlomo (principal axis + 2.5-h moving average). The
+original analysis used the north–south component (v) without smoothing.
+
+```{r fig3-eilat-princess}
+temp_ep_30 <- all_clean_data %>%
+  filter(type == "Temp") %>%
+  pivot_longer(cols = starts_with("temp...depth"), names_to = "sensor", values_to = "temp_c") %>%
+  mutate(depth_m = as.numeric(str_extract(sensor, "\\d+"))) %>%
+  filter(depth_m %in% c(100, 99, 97, 95), !is.na(temp_c)) %>%
+  mutate(time = floor_date(time, "30 minutes")) %>%
+  group_by(canyon, station_id, depth_m, time) %>%
+  summarise(temp_c = mean(temp_c), .groups = "drop")
+
+pca_ep <- calc_principal_axes(curr_ep, station_id) %>%
+  mutate(principal_axis_1 = orient_north(principal_axis_1))
+pca_ep
+
+curr_ep_30 <- curr_ep %>%
+  left_join(select(pca_ep, station_id, principal_axis_1), by = "station_id") %>%
+  mutate(time      = floor_date(time, "30 minutes"),
+         theta_rad = (90 - principal_axis_1) * pi / 180,
+         v_pca     = u * cos(theta_rad) + v * sin(theta_rad)) %>%   # along-axis velocity
+  group_by(station_id, time) %>%
+  summarise(v_along = mean(v_pca, na.rm = TRUE), .groups = "drop")
+
+ccf_ep <- temp_ep_30 %>%
+  inner_join(curr_ep_30, by = c("station_id", "time")) %>%
+  mutate(height = case_when(depth_m == 100 ~ "Seabed",
+                            depth_m == 99  ~ "1m Above Seabed",
+                            depth_m == 97  ~ "3m Above Seabed",
+                            depth_m == 95  ~ "5m Above Seabed")) %>%
+  group_by(canyon, station_id, height, depth_m) %>%
+  arrange(time, .by_group = TRUE) %>%
+  mutate(temp_smooth = rollmean(temp_c,  k = 5, fill = NA, align = "center"),
+         v_smooth    = rollmean(v_along, k = 5, fill = NA, align = "center")) %>%
+  filter(!is.na(temp_smooth), !is.na(v_smooth)) %>%
+  reframe(tidy_ccf(v_smooth, temp_smooth, lag_max = 24))
+```
+
+## 6.3 Assemble Figure 4
+
+```{r fig3-assemble, fig.width=17, fig.height=11}
+ccf_all <- bind_rows(ccf_shlomo, ccf_ep) %>%
+  mutate(lag_hours = lag / 2)
+
+heights  <- c("Seabed", "1m Above Seabed", "3m Above Seabed", "5m Above Seabed")
+canyons  <- c("Shlomo", "Eilat", "Princess")
+
+theme_ccf <- theme_bw() + theme_fig +
+  theme(strip.background = element_rect(fill = "white", color = "black", linewidth = 1),
+        panel.grid.major = element_line(color = "grey90", linetype = "dotted"),
+        panel.grid.minor = element_blank())
+
+ccf_panel <- function(cy, h, show_x, show_y) {
+  df   <- filter(ccf_all, canyon == cy, height == h) %>% mutate(panel = h)
+  ylim <- range(filter(ccf_all, canyon == cy)$acf)   # shared within a row
+  dodge <- position_dodge(width = if (cy == "Shlomo") 0.35 else 0.7)
+
+  p <- ggplot(df, aes(x = lag_hours, y = acf, color = station_id, group = station_id)) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+    geom_hline(yintercept = c(-0.15, 0.15), linetype = "dashed", color = "grey65", alpha = 0.6) +
+    geom_linerange(aes(ymin = pmin(0, acf), ymax = pmax(0, acf)),
+                   position = dodge, linewidth = 0.6, alpha = 0.85, key_glyph = "path") +
+    geom_point(position = dodge, size = 1.8) +
+    facet_wrap(~ panel) +
+    scale_colour_station(guide = "none") +
+    scale_x_continuous(breaks = seq(-12, 12, by = 6), limits = c(-12.5, 12.5)) +
+    scale_y_continuous(breaks = breaks_2dec, labels = label_2dec) +
+    coord_cartesian(ylim = ylim) +
+    labs(x = NULL, y = NULL) +
+    theme_ccf
+  if (!show_x) p <- p + hide_axis_text("x")
+  if (!show_y) p <- p + hide_axis_text("y")
+  p
+}
+
+ccf_panels <- list()
+for (i in seq_along(canyons)) for (j in seq_along(heights)) {
+  ccf_panels[[length(ccf_panels) + 1]] <-
+    ccf_panel(canyons[i], heights[j], show_x = i == 3, show_y = j == 1)
+}
+
+design_fig4 <- "
+ABCDM
+EFGHM
+IJKLM
+"
+
+figure4_panels <- wrap_plots(ccf_panels) + station_legend("fill") +
+  plot_layout(design = design_fig4, widths = c(1, 1, 1, 1, 1.3)) +
+  plot_annotation(tag_levels = list(c(LETTERS[1:12], ""))) &   # legend panel untagged
+  tag_inside(0.02, 0.99)
+
+figure_4 <- add_figure_titles(figure4_panels,
+                             y = "Cross-Correlation Coefficient (CCF)",
+                             x = "Lag (h)", x_hjust = 0.38)
+
+figure_4
+
+save_figure(figure_4, "Figure 4", width = 17, height = 11)
+```
+
+# Save the workspace and the R session information
+
+```{r save-session}
+save.image(file = file.path(out_dir, "01_Oceanographic_Data.RData"))
+sessionInfo()
+```
